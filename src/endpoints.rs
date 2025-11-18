@@ -17,6 +17,7 @@ use tracing::{debug, error};
 pub struct QueryEndpoints {
     object_store: Arc<ObjectStore>,
     transaction_store: Arc<TransactionStore>,
+    #[allow(dead_code)]
     event_store: Arc<EventStore>,
 }
 
@@ -233,6 +234,7 @@ impl QueryEndpoints {
 
 /// Transaction endpoints for submitting transactions
 pub struct TransactionEndpoints {
+    #[allow(dead_code)]
     transaction_store: Arc<TransactionStore>,
 }
 

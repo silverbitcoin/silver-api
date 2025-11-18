@@ -31,6 +31,7 @@ use tracing::{debug, error, info, warn};
 const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 10;
 
 /// Event delivery timeout (500ms as per requirements)
+#[allow(dead_code)]
 const EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Subscription ID
