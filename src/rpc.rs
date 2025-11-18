@@ -5,7 +5,7 @@
 use crate::rate_limit::RateLimiter;
 use axum::{
     extract::{ConnectInfo, State, WebSocketUpgrade},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -13,7 +13,6 @@ use axum::{
 use jsonrpsee::server::ServerHandle;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use silver_core::{Object, ObjectID, SilverAddress, Transaction, TransactionDigest};
 use std::{net::SocketAddr, sync::Arc};
 
 use tower_http::cors::{Any, CorsLayer};
