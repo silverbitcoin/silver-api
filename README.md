@@ -14,34 +14,34 @@ The event subscription system provides:
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Event Flow                                │
-├─────────────────────────────────────────────────────────────┤
+┌────────────────────────────────────────────────────────────--─┐
+│                    Event Flow                                 │
+├────────────────────────────────────────────────────────────--─┤
 │                                                               │
-│  1. Transaction Execution                                    │
-│     ┌──────────────────┐                                    │
-│     │ TransactionExecutor │ ──► Emits events during execution│
-│     └──────────────────┘                                    │
+│  1. Transaction Execution                                     │
+│     ┌──────────────────┐                                      │
+│     │ TransactionExecutor │ ──► Emits events during execution │
+│     └──────────────────┘                                      │
 │              │                                                │
 │              ▼                                                │
-│  2. Event Emission                                           │
-│     ┌──────────────────┐                                    │
-│     │  EventEmitter    │ ──► Persists to EventStore         │
-│     └──────────────────┘                                    │
+│  2. Event Emission                                            │
+│     ┌──────────────────┐                                      │
+│     │  EventEmitter    │ ──► Persists to EventStore           │
+│     └──────────────────┘                                      │
 │              │                                                │
 │              ▼                                                │
-│  3. Event Broadcasting                                       │
-│     ┌──────────────────┐                                    │
-│     │ SubscriptionMgr  │ ──► Broadcasts to subscribers      │
-│     └──────────────────┘                                    │
+│  3. Event Broadcasting                                        │
+│     ┌──────────────────┐                                      │
+│     │ SubscriptionMgr  │ ──► Broadcasts to subscribers        │
+│     └──────────────────┘                                      │
 │              │                                                │
 │              ▼                                                │
-│  4. Event Delivery                                           │
-│     ┌──────────────────┐                                    │
-│     │ WebSocket Client │ ◄── Receives filtered events       │
-│     └──────────────────┘                                    │
+│  4. Event Delivery                                            │
+│     ┌──────────────────┐                                      │
+│     │ WebSocket Client │ ◄── Receives filtered events         │
+│     └──────────────────┘                                      │
 │                                                               │
-└─────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────--─┘
 ```
 
 ## Components
@@ -497,6 +497,6 @@ cargo doc --package silver-api --open
 ## Support
 
 For issues or questions:
-- GitHub Issues: https://github.com/silverbitcoin/silverbitcoin-blockchain/issues
+- GitHub Issues: https://github.com/silverbitcoin/silverbitcoin/issues
 - Documentation: https://docs.silverbitcoin.org
 - Community: https://discord.gg/silverbitcoin
