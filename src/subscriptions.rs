@@ -247,6 +247,13 @@ impl EventNotification {
             EventType::Custom(name) => name.clone(),
         };
 
+        // Extract object type from event data if available
+        let object_type = if let Ok(event_data) = bcs::from_bytes::<serde_json::Value>(&event.data) {
+            event_data.get("type").and_then(|t| t.as_str()).map(|s| s.to_string())
+        } else {
+            None
+        };
+
         Self {
             subscription_id,
             event_id: event.event_id.value(),
@@ -254,7 +261,7 @@ impl EventNotification {
             event_type: event_type_str,
             sender,
             object_id: event.object_id,
-            object_type: None, // TODO: Extract from event data if needed
+            object_type,
             data: hex::encode(&event.data),
             timestamp: event.timestamp,
         }

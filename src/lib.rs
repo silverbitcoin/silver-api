@@ -46,6 +46,8 @@ pub mod rpc;
 pub mod endpoints;
 pub mod rate_limit;
 pub mod subscriptions;
+pub mod validator_endpoints;
+pub mod performance;
 
 pub use rpc::{RpcServer, RpcConfig, JsonRpcRequest, JsonRpcResponse, JsonRpcError};
 pub use endpoints::{QueryEndpoints, TransactionEndpoints};
@@ -53,4 +55,14 @@ pub use rate_limit::RateLimiter;
 pub use subscriptions::{
     SubscriptionManager, EventFilter, EventNotification, SubscriptionID,
     SubscribeRequest, SubscribeResponse, UnsubscribeRequest,
+};
+pub use validator_endpoints::{
+    ValidatorEndpoints, ValidatorInfoResponse, DelegationInfoResponse,
+    RewardClaimRequest, RewardClaimResponse, StakeTransactionRequest,
+    StakeTransactionResponse, RewardHistoryResponse, PerformanceMetricsResponse,
+    AlertResponse, HealthStatusResponse, handle_validator_rpc,
+};
+pub use performance::{
+    QueryCache, BatchProcessor, ConnectionPool, QueryOptimizer, MemoryPool,
+    PerformanceMonitor, PerformanceMetrics, CacheStats, PoolStats,
 };
