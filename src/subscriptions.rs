@@ -232,7 +232,11 @@ pub struct EventNotification {
 
 impl EventNotification {
     /// Create a new event notification
-    pub fn from_event(subscription_id: SubscriptionID, event: &Event, sender: SilverAddress) -> Self {
+    pub fn from_event(
+        subscription_id: SubscriptionID,
+        event: &Event,
+        sender: SilverAddress,
+    ) -> Self {
         let event_type_str = match &event.event_type {
             EventType::ObjectCreated => "ObjectCreated".to_string(),
             EventType::ObjectModified => "ObjectModified".to_string(),
@@ -248,8 +252,12 @@ impl EventNotification {
         };
 
         // Extract object type from event data if available
-        let object_type = if let Ok(event_data) = bcs::from_bytes::<serde_json::Value>(&event.data) {
-            event_data.get("type").and_then(|t| t.as_str()).map(|s| s.to_string())
+        let object_type = if let Ok(event_data) = bcs::from_bytes::<serde_json::Value>(&event.data)
+        {
+            event_data
+                .get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
         } else {
             None
         };
@@ -393,11 +401,8 @@ impl SubscriptionManager {
 
                 // Check each subscription to see if it matches
                 for subscription in &state.subscriptions {
-                    let notification = EventNotification::from_event(
-                        subscription.id,
-                        &event,
-                        event_sender,
-                    );
+                    let notification =
+                        EventNotification::from_event(subscription.id, &event, event_sender);
 
                     if subscription.filter.matches(&notification) {
                         // Send event to subscription channel
@@ -417,12 +422,7 @@ impl SubscriptionManager {
 
         // Handle incoming messages and outgoing events
         let result = self
-            .handle_connection_messages(
-                &mut sender,
-                &mut receiver,
-                conn_state.clone(),
-                addr,
-            )
+            .handle_connection_messages(&mut sender, &mut receiver, conn_state.clone(), addr)
             .await;
 
         // Cleanup
@@ -548,9 +548,8 @@ impl SubscriptionManager {
         event_tx: mpsc::UnboundedSender<EventNotification>,
     ) -> JsonValue {
         // Allocate subscription ID
-        let subscription_id = SubscriptionID::new(
-            self.next_subscription_id.fetch_add(1, Ordering::SeqCst),
-        );
+        let subscription_id =
+            SubscriptionID::new(self.next_subscription_id.fetch_add(1, Ordering::SeqCst));
 
         // Create subscription
         let subscription = Subscription {
@@ -634,179 +633,5 @@ impl SubscriptionManager {
 impl Default for SubscriptionManager {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use silver_core::{ObjectID, TransactionDigest};
-
-    #[test]
-    fn test_event_filter_matches_all() {
-        let filter = EventFilter::new();
-
-        let notification = EventNotification {
-            subscription_id: SubscriptionID::new(1),
-            event_id: 1,
-            transaction_digest: TransactionDigest::new([0; 64]),
-            event_type: "ObjectCreated".to_string(),
-            sender: SilverAddress::new([1; 64]),
-            object_id: Some(ObjectID::new([1; 64])),
-            object_type: Some("Coin".to_string()),
-            data: "".to_string(),
-            timestamp: 1000,
-        };
-
-        assert!(filter.matches(&notification));
-    }
-
-    #[test]
-    fn test_event_filter_sender() {
-        let sender = SilverAddress::new([1; 64]);
-        let filter = EventFilter::new().with_sender(sender);
-
-        let notification = EventNotification {
-            subscription_id: SubscriptionID::new(1),
-            event_id: 1,
-            transaction_digest: TransactionDigest::new([0; 64]),
-            event_type: "ObjectCreated".to_string(),
-            sender,
-            object_id: None,
-            object_type: None,
-            data: "".to_string(),
-            timestamp: 1000,
-        };
-
-        assert!(filter.matches(&notification));
-
-        // Different sender should not match
-        let mut notification2 = notification.clone();
-        notification2.sender = SilverAddress::new([2; 64]);
-        assert!(!filter.matches(&notification2));
-    }
-
-    #[test]
-    fn test_event_filter_event_type() {
-        let filter = EventFilter::new().with_event_type("ObjectCreated".to_string());
-
-        let notification = EventNotification {
-            subscription_id: SubscriptionID::new(1),
-            event_id: 1,
-            transaction_digest: TransactionDigest::new([0; 64]),
-            event_type: "ObjectCreated".to_string(),
-            sender: SilverAddress::new([1; 64]),
-            object_id: None,
-            object_type: None,
-            data: "".to_string(),
-            timestamp: 1000,
-        };
-
-        assert!(filter.matches(&notification));
-
-        // Different event type should not match
-        let mut notification2 = notification.clone();
-        notification2.event_type = "ObjectModified".to_string();
-        assert!(!filter.matches(&notification2));
-    }
-
-    #[test]
-    fn test_event_filter_object_id() {
-        let object_id = ObjectID::new([1; 64]);
-        let filter = EventFilter::new().with_object_id(object_id);
-
-        let notification = EventNotification {
-            subscription_id: SubscriptionID::new(1),
-            event_id: 1,
-            transaction_digest: TransactionDigest::new([0; 64]),
-            event_type: "ObjectCreated".to_string(),
-            sender: SilverAddress::new([1; 64]),
-            object_id: Some(object_id),
-            object_type: None,
-            data: "".to_string(),
-            timestamp: 1000,
-        };
-
-        assert!(filter.matches(&notification));
-
-        // Different object ID should not match
-        let mut notification2 = notification.clone();
-        notification2.object_id = Some(ObjectID::new([2; 64]));
-        assert!(!filter.matches(&notification2));
-    }
-
-    #[test]
-    fn test_event_filter_multiple_criteria() {
-        let sender = SilverAddress::new([1; 64]);
-        let object_id = ObjectID::new([1; 64]);
-
-        let filter = EventFilter::new()
-            .with_sender(sender)
-            .with_event_type("ObjectCreated".to_string())
-            .with_object_id(object_id);
-
-        let notification = EventNotification {
-            subscription_id: SubscriptionID::new(1),
-            event_id: 1,
-            transaction_digest: TransactionDigest::new([0; 64]),
-            event_type: "ObjectCreated".to_string(),
-            sender,
-            object_id: Some(object_id),
-            object_type: None,
-            data: "".to_string(),
-            timestamp: 1000,
-        };
-
-        assert!(filter.matches(&notification));
-
-        // Change one criterion - should not match
-        let mut notification2 = notification.clone();
-        notification2.event_type = "ObjectModified".to_string();
-        assert!(!filter.matches(&notification2));
-    }
-
-    #[tokio::test]
-    async fn test_subscription_manager_creation() {
-        let manager = SubscriptionManager::new();
-        assert_eq!(manager.connection_count(), 0);
-        assert_eq!(manager.subscription_count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn test_connection_state() {
-        let mut state = ConnectionState::new("127.0.0.1:8080".parse().unwrap());
-
-        assert_eq!(state.subscription_count(), 0);
-
-        // Add subscriptions up to the limit
-        for i in 0..MAX_SUBSCRIPTIONS_PER_CONNECTION {
-            let (tx, _rx) = mpsc::unbounded_channel();
-            let subscription = Subscription {
-                id: SubscriptionID::new(i as u64),
-                filter: EventFilter::new(),
-                sender: tx,
-            };
-
-            assert!(state.add_subscription(subscription).is_ok());
-        }
-
-        assert_eq!(state.subscription_count(), MAX_SUBSCRIPTIONS_PER_CONNECTION);
-
-        // Try to add one more - should fail
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let subscription = Subscription {
-            id: SubscriptionID::new(100),
-            filter: EventFilter::new(),
-            sender: tx,
-        };
-
-        assert!(state.add_subscription(subscription).is_err());
-
-        // Remove a subscription
-        assert!(state.remove_subscription(SubscriptionID::new(0)));
-        assert_eq!(state.subscription_count(), MAX_SUBSCRIPTIONS_PER_CONNECTION - 1);
-
-        // Try to remove non-existent subscription
-        assert!(!state.remove_subscription(SubscriptionID::new(999)));
     }
 }

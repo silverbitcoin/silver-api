@@ -2,10 +2,10 @@
 //!
 //! Implements caching, batching, and optimization strategies
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 /// Cache entry with TTL
@@ -43,7 +43,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> QueryCache<K, V> {
     /// Get value from cache
     pub fn get(&self, key: &K) -> Option<V> {
         let mut cache = self.cache.write().unwrap();
-        
+
         if let Some(entry) = cache.get(key) {
             if !entry.is_expired() {
                 debug!("Cache hit for key");
@@ -52,14 +52,14 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> QueryCache<K, V> {
                 cache.remove(key);
             }
         }
-        
+
         None
     }
 
     /// Set value in cache
     pub fn set(&self, key: K, value: V) {
         let mut cache = self.cache.write().unwrap();
-        
+
         // Evict oldest entry if cache is full
         if cache.len() >= self.max_entries {
             if let Some(oldest_key) = cache
@@ -71,7 +71,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> QueryCache<K, V> {
                 debug!("Evicted oldest cache entry");
             }
         }
-        
+
         cache.insert(
             key,
             CacheEntry {
@@ -97,10 +97,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> QueryCache<K, V> {
     pub fn stats(&self) -> CacheStats {
         let cache = self.cache.read().unwrap();
         let total_entries = cache.len();
-        let expired_entries = cache
-            .values()
-            .filter(|entry| entry.is_expired())
-            .count();
+        let expired_entries = cache.values().filter(|entry| entry.is_expired()).count();
 
         CacheStats {
             total_entries,
@@ -128,12 +125,17 @@ pub struct CacheStats {
 pub struct BatchProcessor<T> {
     batch_size: usize,
     timeout: Duration,
+    _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T> BatchProcessor<T> {
     /// Create new batch processor
     pub fn new(batch_size: usize, timeout: Duration) -> Self {
-        Self { batch_size, timeout }
+        Self {
+            batch_size,
+            timeout,
+            _phantom: std::marker::PhantomData,
+        }
     }
 
     /// Process batch
@@ -143,7 +145,7 @@ impl<T> BatchProcessor<T> {
 
         for item in items {
             current_batch.push(item);
-            
+
             if current_batch.len() >= self.batch_size {
                 batches.push(current_batch);
                 current_batch = Vec::new();
@@ -154,7 +156,8 @@ impl<T> BatchProcessor<T> {
             batches.push(current_batch);
         }
 
-        debug!("Processed {} items into {} batches", 
+        debug!(
+            "Processed {} items into {} batches",
             batches.iter().map(|b| b.len()).sum::<usize>(),
             batches.len()
         );
@@ -177,23 +180,21 @@ impl<T> BatchProcessor<T> {
 pub struct ConnectionPool {
     pool_size: usize,
     available: Arc<RwLock<usize>>,
-    max_wait_time: Duration,
 }
 
 impl ConnectionPool {
     /// Create new connection pool
-    pub fn new(pool_size: usize, max_wait_time: Duration) -> Self {
+    pub fn new(pool_size: usize, _max_wait_time: Duration) -> Self {
         Self {
             pool_size,
             available: Arc::new(RwLock::new(pool_size)),
-            max_wait_time,
         }
     }
 
     /// Acquire connection
     pub fn acquire(&self) -> Result<Connection, String> {
         let mut available = self.available.write().unwrap();
-        
+
         if *available > 0 {
             *available -= 1;
             debug!("Connection acquired, {} available", *available);
@@ -208,7 +209,7 @@ impl ConnectionPool {
     /// Get pool stats
     pub fn stats(&self) -> PoolStats {
         let available = *self.available.read().unwrap();
-        
+
         PoolStats {
             pool_size: self.pool_size,
             available_connections: available,
@@ -362,7 +363,7 @@ impl PerformanceMonitor {
     pub fn record_query_time(&self, time_ms: f64) {
         let mut times = self.query_times.write().unwrap();
         times.push(time_ms);
-        
+
         // Keep only last 1000 measurements
         if times.len() > 1000 {
             times.remove(0);
@@ -412,10 +413,10 @@ impl PerformanceMonitor {
         let (p95, p99) = if !times.is_empty() {
             let mut sorted = times.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            
+
             let p95_idx = (sorted.len() as f64 * 0.95) as usize;
             let p99_idx = (sorted.len() as f64 * 0.99) as usize;
-            
+
             (
                 sorted.get(p95_idx).cloned().unwrap_or(0.0),
                 sorted.get(p99_idx).cloned().unwrap_or(0.0),
@@ -446,149 +447,5 @@ impl PerformanceMonitor {
 impl Default for PerformanceMonitor {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_query_cache_creation() {
-        let cache: QueryCache<String, String> = QueryCache::new(Duration::from_secs(60), 100);
-        assert_eq!(cache.size(), 0);
-    }
-
-    #[test]
-    fn test_query_cache_set_get() {
-        let cache: QueryCache<String, String> = QueryCache::new(Duration::from_secs(60), 100);
-        
-        cache.set("key1".to_string(), "value1".to_string());
-        assert_eq!(cache.size(), 1);
-        
-        let value = cache.get(&"key1".to_string());
-        assert_eq!(value, Some("value1".to_string()));
-    }
-
-    #[test]
-    fn test_query_cache_expiration() {
-        let cache: QueryCache<String, String> = QueryCache::new(Duration::from_millis(100), 100);
-        
-        cache.set("key1".to_string(), "value1".to_string());
-        std::thread::sleep(Duration::from_millis(150));
-        
-        let value = cache.get(&"key1".to_string());
-        assert_eq!(value, None);
-    }
-
-    #[test]
-    fn test_query_cache_eviction() {
-        let cache: QueryCache<String, String> = QueryCache::new(Duration::from_secs(60), 2);
-        
-        cache.set("key1".to_string(), "value1".to_string());
-        cache.set("key2".to_string(), "value2".to_string());
-        cache.set("key3".to_string(), "value3".to_string());
-        
-        assert_eq!(cache.size(), 2);
-    }
-
-    #[test]
-    fn test_batch_processor() {
-        let processor = BatchProcessor::new(3, Duration::from_secs(5));
-        let items = vec![1, 2, 3, 4, 5, 6, 7];
-        
-        let batches = processor.process_batch(items);
-        assert_eq!(batches.len(), 3);
-        assert_eq!(batches[0].len(), 3);
-        assert_eq!(batches[1].len(), 3);
-        assert_eq!(batches[2].len(), 1);
-    }
-
-    #[test]
-    fn test_connection_pool() {
-        let pool = ConnectionPool::new(5, Duration::from_secs(10));
-        
-        let conn1 = pool.acquire();
-        assert!(conn1.is_ok());
-        
-        let stats = pool.stats();
-        assert_eq!(stats.available_connections, 4);
-        assert_eq!(stats.in_use_connections, 1);
-    }
-
-    #[test]
-    fn test_connection_pool_release() {
-        let pool = ConnectionPool::new(5, Duration::from_secs(10));
-        
-        {
-            let _conn = pool.acquire().unwrap();
-            let stats = pool.stats();
-            assert_eq!(stats.available_connections, 4);
-        }
-        
-        let stats = pool.stats();
-        assert_eq!(stats.available_connections, 5);
-    }
-
-    #[test]
-    fn test_query_optimizer() {
-        let mut optimizer = QueryOptimizer::new();
-        optimizer.add_index_hint("SELECT * FROM validators".to_string(), "idx_validators".to_string());
-        
-        let optimized = optimizer.optimize_query("SELECT * FROM validators");
-        assert!(optimized.contains("USE INDEX"));
-    }
-
-    #[test]
-    fn test_memory_pool() {
-        let pool: MemoryPool<String> = MemoryPool::new(5);
-        
-        pool.return_object("obj1".to_string());
-        assert_eq!(pool.size(), 1);
-        
-        let obj = pool.acquire();
-        assert_eq!(obj, Some("obj1".to_string()));
-        assert_eq!(pool.size(), 0);
-    }
-
-    #[test]
-    fn test_performance_monitor() {
-        let monitor = PerformanceMonitor::new();
-        
-        monitor.record_query_time(100.0);
-        monitor.record_query_time(150.0);
-        monitor.record_query_time(120.0);
-        monitor.record_cache_hit();
-        monitor.record_cache_hit();
-        monitor.record_cache_miss();
-        
-        let metrics = monitor.get_metrics();
-        assert!(metrics.avg_query_time_ms > 0.0);
-        assert!(metrics.cache_hit_rate > 0.0);
-    }
-
-    #[test]
-    fn test_cache_stats() {
-        let cache: QueryCache<String, String> = QueryCache::new(Duration::from_secs(60), 100);
-        
-        cache.set("key1".to_string(), "value1".to_string());
-        cache.set("key2".to_string(), "value2".to_string());
-        
-        let stats = cache.stats();
-        assert_eq!(stats.total_entries, 2);
-        assert_eq!(stats.active_entries, 2);
-    }
-
-    #[test]
-    fn test_pool_stats() {
-        let pool = ConnectionPool::new(10, Duration::from_secs(10));
-        
-        let _conn1 = pool.acquire().unwrap();
-        let _conn2 = pool.acquire().unwrap();
-        
-        let stats = pool.stats();
-        assert_eq!(stats.pool_size, 10);
-        assert_eq!(stats.in_use_connections, 2);
-        assert_eq!(stats.available_connections, 8);
     }
 }

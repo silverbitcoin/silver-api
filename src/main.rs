@@ -1,19 +1,19 @@
 //! SilverBitcoin RPC Server
 //!
 //! Standalone RPC server for blockchain interaction.
-//! 
+//!
 //! Usage:
 //! ```bash
 //! cargo run --release -- --http 127.0.0.1:9000 --ws 127.0.0.1:9001 --db ./data
 //! ```
 
 use clap::Parser;
-use silver_api::{RpcServer, RpcConfig, QueryEndpoints, TransactionEndpoints};
-use silver_storage::{ObjectStore, TransactionStore, EventStore, RocksDatabase};
+use silver_api::{ExplorerEndpoints, QueryEndpoints, RpcConfig, RpcServer, TransactionEndpoints};
+use silver_storage::{BlockStore, EventStore, ObjectStore, RocksDatabase, TransactionStore};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, error};
+use tracing::info;
 use tracing_subscriber;
 
 #[derive(Parser, Debug)]
@@ -41,7 +41,7 @@ struct Args {
     rate_limit: u32,
 
     /// Enable CORS
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value = "false")]
     enable_cors: bool,
 
     /// Log level (trace, debug, info, warn, error)
@@ -74,16 +74,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let object_store = Arc::new(ObjectStore::new(Arc::clone(&db)));
     let transaction_store = Arc::new(TransactionStore::new(Arc::clone(&db)));
     let event_store = Arc::new(EventStore::new(Arc::clone(&db)));
+    let block_store = Arc::new(BlockStore::new(Arc::clone(&db)));
 
     info!("Database initialized successfully");
 
+    // Initialize genesis block if it doesn't exist
+    if let Ok(None) = block_store.get_block(0) {
+        info!("Genesis block not found, creating genesis block 0");
+        let genesis_block = silver_storage::Block::new(
+            0,
+            vec![0u8; 32],
+            vec![0u8; 32],
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            vec![],
+            vec![0u8; 32],
+            0,
+            0,
+        );
+        block_store.store_block(&genesis_block)?;
+        info!("Genesis block 0 created and stored successfully");
+    } else {
+        info!("Genesis block 0 already exists");
+    }
+
     // Create endpoints
     let query_endpoints = Arc::new(QueryEndpoints::new(
-        object_store,
-        transaction_store.clone(),
-        event_store,
+        Arc::clone(&object_store),
+        Arc::clone(&transaction_store),
+        Arc::clone(&block_store),
+        Arc::clone(&event_store),
     ));
-    let transaction_endpoints = Arc::new(TransactionEndpoints::new(transaction_store));
+    let transaction_endpoints = Arc::new(TransactionEndpoints::new(Arc::clone(&transaction_store)));
+    let explorer_endpoints = Arc::new(ExplorerEndpoints::new(
+        Arc::clone(&object_store),
+        Arc::clone(&transaction_store),
+        Arc::clone(&block_store),
+    ));
 
     // Create RPC server configuration
     let config = RpcConfig {
@@ -96,8 +125,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limit_per_ip: args.rate_limit,
     };
 
-    // Create and start RPC server
-    let mut server = RpcServer::with_endpoints(config, query_endpoints, transaction_endpoints);
+    // Create validator endpoints
+    let validator_endpoints = Arc::new(silver_api::ValidatorEndpoints::new());
+
+    // Create and start RPC server with all endpoints including validators
+    let mut server = RpcServer::with_all_endpoints_and_validators(
+        config,
+        query_endpoints,
+        transaction_endpoints,
+        explorer_endpoints,
+        validator_endpoints,
+    );
 
     info!("Starting RPC servers...");
     server.start().await?;

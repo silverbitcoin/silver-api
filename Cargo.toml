@@ -46,6 +46,7 @@ bs58 = { workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
 base64 = { workspace = true }
+bcs = "0.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

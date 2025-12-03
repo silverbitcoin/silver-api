@@ -42,27 +42,28 @@
 #![warn(missing_docs, rust_2018_idioms)]
 #![forbid(unsafe_code)]
 
-pub mod rpc;
 pub mod endpoints;
+pub mod explorer_endpoints;
+pub mod performance;
 pub mod rate_limit;
+pub mod rpc;
 pub mod subscriptions;
 pub mod validator_endpoints;
-pub mod performance;
 
-pub use rpc::{RpcServer, RpcConfig, JsonRpcRequest, JsonRpcResponse, JsonRpcError};
 pub use endpoints::{QueryEndpoints, TransactionEndpoints};
+pub use explorer_endpoints::ExplorerEndpoints;
+pub use performance::{
+    BatchProcessor, CacheStats, ConnectionPool, MemoryPool, PerformanceMetrics, PerformanceMonitor,
+    PoolStats, QueryCache, QueryOptimizer,
+};
 pub use rate_limit::RateLimiter;
+pub use rpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, RpcConfig, RpcServer};
 pub use subscriptions::{
-    SubscriptionManager, EventFilter, EventNotification, SubscriptionID,
-    SubscribeRequest, SubscribeResponse, UnsubscribeRequest,
+    EventFilter, EventNotification, SubscribeRequest, SubscribeResponse, SubscriptionID,
+    SubscriptionManager, UnsubscribeRequest,
 };
 pub use validator_endpoints::{
-    ValidatorEndpoints, ValidatorInfoResponse, DelegationInfoResponse,
-    RewardClaimRequest, RewardClaimResponse, StakeTransactionRequest,
-    StakeTransactionResponse, RewardHistoryResponse, PerformanceMetricsResponse,
-    AlertResponse, HealthStatusResponse, handle_validator_rpc,
-};
-pub use performance::{
-    QueryCache, BatchProcessor, ConnectionPool, QueryOptimizer, MemoryPool,
-    PerformanceMonitor, PerformanceMetrics, CacheStats, PoolStats,
+    handle_validator_rpc, AlertResponse, DelegationInfoResponse, HealthStatusResponse,
+    PerformanceMetricsResponse, RewardClaimRequest, RewardClaimResponse, RewardHistoryResponse,
+    StakeTransactionRequest, StakeTransactionResponse, ValidatorEndpoints, ValidatorInfoResponse,
 };
