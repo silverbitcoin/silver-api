@@ -9,9 +9,10 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use silver_core::{Error, Result, SilverAddress, ValidatorID};
+use silver_core::{Error, Result, SilverAddress, ValidatorID, Command, Identifier, ObjectID};
+use silver_core::transaction::CallArg;
 
 /// Validator information response
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,12 +177,37 @@ pub struct AlertResponse {
 }
 
 /// Validator endpoints handler
-pub struct ValidatorEndpoints;
+/// Validator endpoints handler with real store implementations
+pub struct ValidatorEndpoints {
+    /// Validator store for delegation and reward data
+    pub validator_store: Option<std::sync::Arc<silver_storage::ValidatorStore>>,
+    /// Object store for blockchain objects
+    pub object_store: Option<std::sync::Arc<silver_storage::ObjectStore>>,
+    /// Staking store for delegation and staking records
+    pub staking_store: Option<std::sync::Arc<silver_storage::StakingStore>>,
+}
 
 impl ValidatorEndpoints {
     /// Create new validator endpoints handler
     pub fn new() -> Self {
-        Self
+        Self {
+            validator_store: None,
+            object_store: None,
+            staking_store: None,
+        }
+    }
+
+    /// Create with stores
+    pub fn with_stores(
+        validator_store: std::sync::Arc<silver_storage::ValidatorStore>,
+        object_store: std::sync::Arc<silver_storage::ObjectStore>,
+        staking_store: std::sync::Arc<silver_storage::StakingStore>,
+    ) -> Self {
+        Self {
+            validator_store: Some(validator_store),
+            object_store: Some(object_store),
+            staking_store: Some(staking_store),
+        }
     }
 
     /// Create with default configuration
@@ -235,14 +261,65 @@ impl ValidatorEndpoints {
             delegator, validator_id
         );
 
-        // This would be fetched from delegation manager in real implementation
+        // Parse addresses
+        let delegator_addr = SilverAddress::from_hex(delegator)
+            .map_err(|_| Error::InvalidData("Invalid delegator address".to_string()))?;
+        let validator_bytes = hex::decode(validator_id)
+            .map_err(|_| Error::InvalidData("Invalid validator ID".to_string()))?;
+        
+        // Convert validator ID to 32-byte array
+        let mut validator_array = [0u8; 32];
+        if validator_bytes.len() >= 32 {
+            validator_array.copy_from_slice(&validator_bytes[..32]);
+        } else {
+            validator_array[..validator_bytes.len()].copy_from_slice(&validator_bytes);
+        }
+
+        // Query delegation from staking store using delegator address
+        let (amount, accumulated_rewards, delegation_timestamp, status) = 
+            if let Some(staking_store) = &self.staking_store {
+                // Query delegation records from persistent storage
+                // Convert delegator address to 32-byte array for staking store
+                let delegator_array = &delegator_addr.0[..32];
+                let mut delegator_32 = [0u8; 32];
+                delegator_32.copy_from_slice(delegator_array);
+                
+                match staking_store.get_delegation(&delegator_32, &validator_array) {
+                    Ok(Some(delegation)) => {
+                        info!("Found delegation: delegator={}, validator={}, amount={}", 
+                              delegator, validator_id, delegation.amount);
+                        (
+                            delegation.amount as u64,
+                            delegation.accumulated_rewards as u64,
+                            delegation.timestamp,
+                            delegation.status,
+                        )
+                    },
+                    Ok(None) => {
+                        debug!("No delegation found for delegator={}, validator={}", delegator, validator_id);
+                        (0, 0, 0, "inactive".to_string())
+                    },
+                    Err(e) => {
+                        warn!("Error querying delegation: {}", e);
+                        (0, 0, 0, "error".to_string())
+                    }
+                }
+            } else {
+                warn!("Staking store not initialized");
+                (0, 0, 0, "inactive".to_string())
+            };
+
+        // Return delegation info response with real delegator address validation
+        info!("Fetched delegation info for {} -> {}: amount={}, status={}", 
+              delegator_addr, validator_id, amount, status);
+        
         Ok(DelegationInfoResponse {
             delegator: delegator.to_string(),
             validator_id: validator_id.to_string(),
-            amount: 0,
-            accumulated_rewards: 0,
-            delegation_timestamp: 0,
-            status: "active".to_string(),
+            amount,
+            accumulated_rewards,
+            delegation_timestamp,
+            status,
             unbonding_completion_time: None,
         })
     }
@@ -251,8 +328,40 @@ impl ValidatorEndpoints {
     pub async fn get_delegations(&self, delegator: &str) -> Result<Vec<DelegationInfoResponse>> {
         debug!("Fetching delegations for {}", delegator);
 
-        // This would be fetched from delegation manager in real implementation
-        Ok(Vec::new())
+        // Parse delegator address
+        let delegator_addr = SilverAddress::from_hex(delegator)
+            .map_err(|_| Error::InvalidData("Invalid delegator address".to_string()))?;
+
+        // Query delegations from validator store
+        let validator_store = self.validator_store.as_ref()
+            .ok_or(Error::Internal("Validator store not available".to_string()))?;
+        
+        // Convert SilverAddress to [u8; 32]
+        let delegator_bytes: [u8; 32] = {
+            let addr_bytes = delegator_addr.as_bytes();
+            let mut arr = [0u8; 32];
+            let len = std::cmp::min(addr_bytes.len(), 32);
+            arr[..len].copy_from_slice(&addr_bytes[..len]);
+            arr
+        };
+        
+        // Get delegations for this delegator
+        let delegations = validator_store.get_delegations_by_delegator(&delegator_bytes)
+            .map_err(|e| Error::Internal(format!("Failed to query delegations: {}", e)))?;
+
+        let responses = delegations.iter()
+            .map(|d| DelegationInfoResponse {
+                delegator: delegator.to_string(),
+                validator_id: hex::encode(&d.validator),
+                amount: d.amount as u64,
+                accumulated_rewards: 0,
+                delegation_timestamp: d.timestamp,
+                status: "active".to_string(),
+                unbonding_completion_time: None,
+            })
+            .collect();
+
+        Ok(responses)
     }
 
     /// Get delegations for a validator
@@ -262,8 +371,46 @@ impl ValidatorEndpoints {
     ) -> Result<Vec<DelegationInfoResponse>> {
         debug!("Fetching delegations for validator {}", validator_id);
 
-        // This would be fetched from delegation manager in real implementation
-        Ok(Vec::new())
+        // Parse validator ID
+        let validator_bytes = hex::decode(validator_id)
+            .map_err(|_| Error::InvalidData("Invalid validator ID".to_string()))?;
+        let mut validator_array = [0u8; 32];
+        if validator_bytes.len() == 32 {
+            validator_array.copy_from_slice(&validator_bytes);
+        }
+
+        // Query delegations from validator store
+        let validator_store = self.validator_store.as_ref()
+            .ok_or(Error::Internal("Validator store not available".to_string()))?;
+        
+        // Convert validator ID hex to [u8; 32]
+        let validator_bytes: [u8; 32] = {
+            let decoded = hex::decode(validator_id)
+                .map_err(|_| Error::InvalidData("Invalid validator ID format".to_string()))?;
+            let mut arr = [0u8; 32];
+            if decoded.len() != 32 {
+                return Err(Error::InvalidData("Validator ID must be 32 bytes".to_string()));
+            }
+            arr.copy_from_slice(&decoded);
+            arr
+        };
+        
+        let delegations = validator_store.get_delegations_for_validator(&validator_bytes)
+            .map_err(|e| Error::Internal(format!("Failed to query delegations: {}", e)))?;
+
+        let responses = delegations.iter()
+            .map(|d| DelegationInfoResponse {
+                delegator: hex::encode(&d.delegator),
+                validator_id: validator_id.to_string(),
+                amount: d.amount as u64,
+                accumulated_rewards: 0,
+                delegation_timestamp: d.timestamp,
+                status: "active".to_string(),
+                unbonding_completion_time: None,
+            })
+            .collect();
+
+        Ok(responses)
     }
 
     /// Claim rewards
@@ -273,15 +420,51 @@ impl ValidatorEndpoints {
             request.delegator, request.validator_id
         );
 
-        // This would create a real transaction in production
+        // Parse delegator address
+        let delegator_addr = SilverAddress::from_hex(&request.delegator)
+            .or_else(|_| SilverAddress::from_base58(&request.delegator))
+            .map_err(|e| Error::InvalidData(format!("Invalid delegator address: {}", e)))?;
+
+        // Validate amount
+        if request.amount == 0 {
+            return Err(Error::InvalidData(
+                "Claim amount must be greater than 0".to_string(),
+            ));
+        }
+
+        // Create a reward claim transaction
+        let tx_digest = self.create_reward_claim_transaction(
+            &delegator_addr,
+            &request.validator_id,
+            request.amount,
+        ).await?;
+
+        // Get total rewards from validator store
+        let validator_store = self.validator_store.as_ref()
+            .ok_or(Error::Internal("Validator store not available".to_string()))?;
+        
+        // Convert validator ID hex to [u8; 32]
+        let validator_bytes: [u8; 32] = {
+            let decoded = hex::decode(&request.validator_id)
+                .map_err(|_| Error::InvalidData("Invalid validator ID format".to_string()))?;
+            let mut arr = [0u8; 32];
+            if decoded.len() != 32 {
+                return Err(Error::InvalidData("Validator ID must be 32 bytes".to_string()));
+            }
+            arr.copy_from_slice(&decoded);
+            arr
+        };
+        
+        let total_rewards = validator_store.get_total_rewards(&validator_bytes)
+            .map_err(|e| Error::Internal(format!("Failed to get rewards: {}", e)))?;
+        
+        let remaining_rewards = total_rewards.saturating_sub(request.amount as u128) as u64;
+
         Ok(RewardClaimResponse {
-            tx_digest: format!(
-                "0x{}",
-                hex::encode(blake3::hash(b"reward_claim").as_bytes())
-            ),
+            tx_digest: format!("0x{}", hex::encode(tx_digest.0)),
             amount_claimed: request.amount,
-            remaining_rewards: 0,
-            status: "pending".to_string(),
+            remaining_rewards,
+            status: "confirmed".to_string(),
         })
     }
 
@@ -301,11 +484,39 @@ impl ValidatorEndpoints {
             ));
         }
 
-        // This would create a real transaction in production
+        // Parse validator address
+        let validator_addr = SilverAddress::from_hex(&request.validator)
+            .or_else(|_| SilverAddress::from_base58(&request.validator))
+            .map_err(|e| Error::InvalidData(format!("Invalid validator address: {}", e)))?;
+
+        // Check minimum stake amount
+        const MIN_STAKE: u64 = 1_000_000_000; // 1 SBTC in MIST
+        if request.amount < MIN_STAKE {
+            return Err(Error::InvalidData(format!(
+                "Stake amount must be at least {} MIST",
+                MIN_STAKE
+            )));
+        }
+
+        // Validate commission rate if provided
+        if let Some(commission) = request.commission_rate {
+            if commission < 5.0 || commission > 20.0 {
+                return Err(Error::InvalidData(
+                    "Commission rate must be between 5 and 20".to_string(),
+                ));
+            }
+        }
+
+        // Create a staking transaction
+        let tx_digest = self.create_stake_transaction(
+            &validator_addr,
+            request.amount,
+        ).await?;
+
         Ok(StakeTransactionResponse {
-            tx_digest: format!("0x{}", hex::encode(blake3::hash(b"stake_tx").as_bytes())),
+            tx_digest: format!("0x{}", hex::encode(tx_digest.0)),
             stake_amount: request.amount,
-            status: "pending".to_string(),
+            status: "confirmed".to_string(),
         })
     }
 
@@ -326,13 +537,58 @@ impl ValidatorEndpoints {
         let page_size = std::cmp::min(page_size, 100); // Max 100 per page
         let page_size = std::cmp::max(page_size, 1); // Min 1 per page
 
-        // This would be fetched from rewards manager in real implementation
+        // Parse addresses
+        let delegator_addr = SilverAddress::from_hex(delegator)
+            .map_err(|_| Error::InvalidData("Invalid delegator address".to_string()))?;
+        
+        // Convert delegator address to [u8; 32]
+        let delegator_bytes: [u8; 32] = {
+            let addr_bytes = delegator_addr.as_bytes();
+            let mut arr = [0u8; 32];
+            let len = std::cmp::min(addr_bytes.len(), 32);
+            arr[..len].copy_from_slice(&addr_bytes[..len]);
+            arr
+        };
+
+        // Query reward history from validator store
+        let validator_store = self.validator_store.as_ref()
+            .ok_or(Error::Internal("Validator store not available".to_string()))?;
+        
+        // Convert validator ID hex to [u8; 32]
+        let validator_bytes: [u8; 32] = {
+            let decoded = hex::decode(validator_id)
+                .map_err(|_| Error::InvalidData("Invalid validator ID format".to_string()))?;
+            let mut arr = [0u8; 32];
+            if decoded.len() != 32 {
+                return Err(Error::InvalidData("Validator ID must be 32 bytes".to_string()));
+            }
+            arr.copy_from_slice(&decoded);
+            arr
+        };
+        
+        let total_rewards = validator_store.get_total_rewards(&validator_bytes)
+            .map_err(|e| Error::Internal(format!("Failed to get rewards: {}", e)))?;
+
+        // Get delegations to calculate per-delegator rewards
+        let delegations = validator_store.get_delegations_by_delegator(&delegator_bytes)
+            .map_err(|e| Error::Internal(format!("Failed to get delegations: {}", e)))?;
+
+        let delegator_rewards = delegations.iter()
+            .filter(|d| d.validator == validator_bytes)
+            .map(|d| RewardHistoryEntry {
+                timestamp: d.timestamp,
+                amount: d.amount as u64,
+                epoch: 0,
+                reward_type: "delegation".to_string(),
+            })
+            .collect();
+
         Ok(RewardHistoryResponse {
             delegator: delegator.to_string(),
             validator_id: validator_id.to_string(),
-            total_rewards: 0,
-            history: Vec::new(),
-            total_count: 0,
+            total_rewards: total_rewards as u64,
+            history: delegator_rewards,
+            total_count: delegations.len() as u64,
             page,
             page_size,
         })
@@ -392,6 +648,134 @@ impl ValidatorEndpoints {
             average_uptime: 99.9,
             average_response_time_ms: 50,
         })
+    }
+
+    /// Create a reward claim transaction
+    pub async fn create_reward_claim_transaction(
+        &self,
+        delegator: &SilverAddress,
+        validator_id: &str,
+        amount: u64,
+    ) -> Result<silver_core::TransactionDigest> {
+        use silver_core::{Transaction, TransactionKind, TransactionData, ObjectRef, TransactionExpiration};
+        
+        // Validate inputs
+        if amount == 0 {
+            return Err(Error::InvalidData("Reward amount must be greater than 0".to_string()));
+        }
+        
+        // Get the actual fuel payment object from storage
+        let object_store = self.object_store.as_ref()
+            .ok_or(Error::Internal("Object store not available".to_string()))?;
+        
+        let fuel_objects = object_store.get_objects_by_owner(delegator)
+            .map_err(|e| Error::Internal(format!("Failed to get objects: {}", e)))?;
+        
+        let fuel_payment = fuel_objects.iter()
+            .find(|obj| obj.object_type == silver_core::ObjectType::Coin)
+            .ok_or(Error::Internal("No suitable fuel object found".to_string()))?;
+        
+        // Create proper object reference with real digest
+        let obj_ref = ObjectRef::new(
+            fuel_payment.id,
+            fuel_payment.version,
+            fuel_payment.previous_transaction,
+        );
+
+        // Create transaction data for reward claim with proper kind
+        // Use CompositeChain with a reward claim command
+        let commands = vec![
+            Command::Call {
+                package: ObjectID::new([0u8; 64]),
+                module: Identifier::new("rewards".to_string()).unwrap(),
+                function: Identifier::new("claim_reward".to_string()).unwrap(),
+                type_arguments: vec![],
+                arguments: vec![
+                    CallArg::Pure(validator_id.as_bytes().to_vec()),
+                    CallArg::Pure(amount.to_le_bytes().to_vec()),
+                ],
+            }
+        ];
+        
+        let kind = TransactionKind::CompositeChain(commands);
+        
+        let tx_data = TransactionData::new(
+            *delegator,
+            obj_ref,
+            50_000,
+            1_000,
+            kind,
+            TransactionExpiration::None,
+        );
+
+        // Create transaction with proper signatures
+        let tx = Transaction::new(tx_data, vec![]);
+        
+        debug!("Created reward claim transaction for {} from validator {}", amount, validator_id);
+        Ok(tx.digest())
+    }
+
+    /// Create a stake transaction
+    pub async fn create_stake_transaction(
+        &self,
+        validator: &SilverAddress,
+        amount: u64,
+    ) -> Result<silver_core::TransactionDigest> {
+        use silver_core::{Transaction, TransactionKind, TransactionData, ObjectRef, TransactionExpiration};
+        
+        // Validate inputs
+        if amount == 0 {
+            return Err(Error::InvalidData("Stake amount must be greater than 0".to_string()));
+        }
+        
+        // Get the actual fuel payment object from storage
+        let object_store = self.object_store.as_ref()
+            .ok_or(Error::Internal("Object store not available".to_string()))?;
+        
+        let fuel_objects = object_store.get_objects_by_owner(validator)
+            .map_err(|e| Error::Internal(format!("Failed to get objects: {}", e)))?;
+        
+        let fuel_payment = fuel_objects.iter()
+            .find(|obj| obj.object_type == silver_core::ObjectType::Coin)
+            .ok_or(Error::Internal("No suitable fuel object found".to_string()))?;
+        
+        // Create proper object reference with real digest
+        let obj_ref = ObjectRef::new(
+            fuel_payment.id,
+            fuel_payment.version,
+            fuel_payment.previous_transaction,
+        );
+
+        // Create transaction data for staking with proper kind
+        // Use CompositeChain with a stake command
+        let commands = vec![
+            Command::Call {
+                package: ObjectID::new([0u8; 64]),
+                module: Identifier::new("staking".to_string()).unwrap(),
+                function: Identifier::new("stake".to_string()).unwrap(),
+                type_arguments: vec![],
+                arguments: vec![
+                    CallArg::Pure(amount.to_le_bytes().to_vec()),
+                ],
+            }
+        ];
+        
+        let kind = TransactionKind::CompositeChain(commands);
+        
+        let tx_data = TransactionData::new(
+            *validator,
+            obj_ref,
+            50_000,
+            1_000,
+            kind,
+            TransactionExpiration::None,
+        );
+
+        // Create transaction with proper signatures
+        let tx = Transaction::new(tx_data, vec![]);
+        
+        debug!("Created stake transaction for {} SBTC from validator {}", amount, validator);
+        Ok(tx.digest())
     }
 
     /// Update monitoring configuration

@@ -33,6 +33,27 @@ impl ExplorerEndpoints {
         }
     }
 
+    /// Convert array parameters to object format for RPC compatibility
+    /// 
+    /// Converts array format [param1, param2, ...] to object format {field1: value1, field2: value2, ...}
+    fn normalize_params(params: JsonValue, field_names: &[&str]) -> Result<JsonValue, JsonRpcError> {
+        match params {
+            JsonValue::Array(arr) => {
+                let mut obj = serde_json::Map::new();
+                for (i, field_name) in field_names.iter().enumerate() {
+                    if let Some(value) = arr.get(i) {
+                        obj.insert(field_name.to_string(), value.clone());
+                    }
+                }
+                Ok(JsonValue::Object(obj))
+            }
+            JsonValue::Object(_) => Ok(params),
+            _ => Err(JsonRpcError::invalid_params(
+                "Parameters must be either an array or object".to_string(),
+            )),
+        }
+    }
+
     /// Get description for genesis accounts
     /// These descriptions are loaded from genesis-mainnet.json initial_accounts
     fn get_genesis_account_description(&self, address: &SilverAddress) -> Option<String> {
@@ -66,7 +87,11 @@ impl ExplorerEndpoints {
     /// silver_getAccountInfo - Get detailed account information
     pub fn silver_get_account_info(&self, params: JsonValue) -> Result<JsonValue, JsonRpcError> {
         let start = Instant::now();
-        let request: GetAccountInfoRequest = serde_json::from_value(params)
+        
+        // Normalize parameters: array format [address] or object format
+        let params_obj = Self::normalize_params(params, &["address"])?;
+        
+        let request: GetAccountInfoRequest = serde_json::from_value(params_obj)
             .map_err(|e| JsonRpcError::invalid_params(format!("Invalid parameters: {}", e)))?;
 
         let address = parse_address(&request.address)?;
@@ -313,21 +338,48 @@ impl ExplorerEndpoints {
         let start = Instant::now();
         debug!("Getting largest token accounts");
 
-        // Collect all coin objects and sort by balance
-        // This is a full scan implementation - in production would use indexed storage
-        // Scan through all objects to find coins and calculate balances
-        // This properly iterates through the object store and aggregates coin balances
-        let accounts_with_balance: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
+        // Collect all coin objects and aggregate balances by owner
+        let mut accounts_with_balance: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
 
-        // In a real implementation, we would iterate through all objects
-        // For now, return empty map as we need to implement proper object iteration
-        match self.object_store.get_object_count() {
-            Ok(count) => {
-                debug!("Total objects in store: {}", count);
-                // TODO: Implement object iterator in ObjectStore
+        // Iterate through all objects to find coins and calculate balances
+        match self.object_store.iterate_all_objects() {
+            Ok(mut iter) => {
+                let mut total_scanned = 0u64;
+                while let Some(obj) = iter.pop() {
+                    total_scanned += 1;
+                    
+                    // Only process coin objects
+                    if !matches!(obj.object_type, silver_core::ObjectType::Coin) {
+                        continue;
+                    }
+
+                    // Extract owner address
+                    let owner_addr = match &obj.owner {
+                        silver_core::Owner::AddressOwner(addr) => addr.to_hex(),
+                        _ => continue,
+                    };
+
+                    // Extract balance from coin data (u64 little-endian)
+                    let balance = if obj.data.len() >= 8 {
+                        u64::from_le_bytes([
+                            obj.data[0], obj.data[1], obj.data[2], obj.data[3],
+                            obj.data[4], obj.data[5], obj.data[6], obj.data[7],
+                        ]) as u128
+                    } else {
+                        0u128
+                    };
+
+                    // Aggregate balance for this owner
+                    *accounts_with_balance.entry(owner_addr).or_insert(0) += balance;
+                }
+                debug!("Scanned {} objects for largest accounts", total_scanned);
             }
             Err(e) => {
-                warn!("Failed to scan objects for balance index: {}", e);
+                error!("Failed to iterate objects for balance index: {}", e);
+                return Err(JsonRpcError::internal_error(format!(
+                    "Failed to scan objects: {}",
+                    e
+                )));
             }
         }
 
@@ -443,18 +495,40 @@ impl ExplorerEndpoints {
             return Err(JsonRpcError::new(-32001, "Program not found"));
         }
 
-        // Query all objects to find accounts that own this program
-        let account_list: Vec<JsonValue> = Vec::new();
+        // Query all objects to find accounts that reference this program
+        let mut account_list: Vec<JsonValue> = Vec::new();
         
-        // In a real implementation, we would iterate through all objects
-        // For now, return empty list as we need to implement proper object iteration
-        match self.object_store.get_object_count() {
-            Ok(count) => {
-                debug!("Total objects in store: {}", count);
-                // TODO: Implement object iterator in ObjectStore
+        match self.object_store.iterate_all_objects() {
+            Ok(mut iter) => {
+                let mut total_scanned = 0u64;
+                while let Some(obj) = iter.pop() {
+                    total_scanned += 1;
+                    
+                    // Check if this object references the program
+                    // This is done by checking if the object's data contains the program ID
+                    let obj_data_str = String::from_utf8_lossy(&obj.data);
+                    if obj_data_str.contains(&program_id.to_base58()) {
+                        let owner_addr = match &obj.owner {
+                            silver_core::Owner::AddressOwner(addr) => addr.to_hex(),
+                            _ => "unknown".to_string(),
+                        };
+
+                        account_list.push(serde_json::json!({
+                            "id": obj.id.to_base58(),
+                            "owner": owner_addr,
+                            "program": program_id.to_base58(),
+                            "data_size": obj.data.len(),
+                        }));
+                    }
+                }
+                debug!("Scanned {} objects for program accounts", total_scanned);
             }
             Err(e) => {
-                warn!("Failed to query accounts for program: {}", e);
+                error!("Failed to iterate objects for program accounts: {}", e);
+                return Err(JsonRpcError::internal_error(format!(
+                    "Failed to query program accounts: {}",
+                    e
+                )));
             }
         }
 
@@ -509,7 +583,11 @@ impl ExplorerEndpoints {
     /// silver_getBlockTime - Get block creation time
     pub fn silver_get_block_time(&self, params: JsonValue) -> Result<JsonValue, JsonRpcError> {
         let start = Instant::now();
-        let request: GetBlockTimeRequest = serde_json::from_value(params)
+        
+        // Normalize parameters: array format [block_number] or object format
+        let params_obj = Self::normalize_params(params, &["block_number"])?;
+        
+        let request: GetBlockTimeRequest = serde_json::from_value(params_obj)
             .map_err(|e| JsonRpcError::invalid_params(format!("Invalid parameters: {}", e)))?;
 
         debug!("Getting block time for block: {}", request.block_number);
@@ -559,17 +637,55 @@ impl ExplorerEndpoints {
         let start = Instant::now();
         debug!("Getting leader schedule");
 
-        // Build a default leader schedule
-        // In a real implementation, this would be based on actual validators and stake
+        // Build leader schedule based on actual validators and stake
         let mut schedule = serde_json::Map::new();
 
-        // Create a default schedule with 4 validators
-        for idx in 0..4 {
-            let slots: Vec<JsonValue> = (0..10)
-                .map(|i| JsonValue::Number(((idx * 10) + i).into()))
-                .collect();
+        // Query all validators from the object store
+        match self.object_store.iterate_all_objects() {
+            Ok(mut iter) => {
+                let mut validator_count = 0u64;
+                let mut slot_assignment = 0u64;
 
-            schedule.insert(format!("validator_{}", idx), JsonValue::Array(slots));
+                while let Some(obj) = iter.pop() {
+                    // Check if this is a validator object
+                    if !matches!(obj.object_type, silver_core::ObjectType::Validator) {
+                        continue;
+                    }
+
+                    validator_count += 1;
+                    let validator_id = obj.id.to_base58();
+
+                    // Assign slots based on validator stake (from object data)
+                    let stake = if obj.data.len() >= 16 {
+                        u128::from_le_bytes([
+                            obj.data[0], obj.data[1], obj.data[2], obj.data[3],
+                            obj.data[4], obj.data[5], obj.data[6], obj.data[7],
+                            obj.data[8], obj.data[9], obj.data[10], obj.data[11],
+                            obj.data[12], obj.data[13], obj.data[14], obj.data[15],
+                        ])
+                    } else {
+                        1u128 // Default stake if not found
+                    };
+
+                    // Calculate slots for this validator (proportional to stake)
+                    let slots_for_validator = std::cmp::max(1, (stake / 1_000_000_000) as u64);
+                    let slots: Vec<JsonValue> = (0..slots_for_validator)
+                        .map(|_| {
+                            let slot = JsonValue::Number(slot_assignment.into());
+                            slot_assignment += 1;
+                            slot
+                        })
+                        .collect();
+
+                    schedule.insert(validator_id, JsonValue::Array(slots));
+                }
+
+                debug!("Built leader schedule for {} validators", validator_count);
+            }
+            Err(e) => {
+                warn!("Failed to query validators for leader schedule: {}", e);
+                // Return empty schedule on error
+            }
         }
 
         let response = serde_json::json!({
@@ -586,19 +702,61 @@ impl ExplorerEndpoints {
         let start = Instant::now();
         debug!("Getting cluster nodes");
 
-        // Create default cluster nodes
-        // In a real implementation, this would query actual validator information
-        let nodes: Vec<JsonValue> = (0..4)
-            .map(|idx| {
-                serde_json::json!({
-                    "pubkey": format!("validator_{}", idx),
-                    "gossip": format!("127.0.0.1:{}", 8000 + idx),
-                    "tpu": format!("127.0.0.1:{}", 8001 + idx),
-                    "rpc": format!("127.0.0.1:{}", 8899),
-                    "version": "0.1.0",
-                })
-            })
-            .collect();
+        // Query actual validator information from the object store
+        let mut nodes: Vec<JsonValue> = Vec::new();
+
+        match self.object_store.iterate_all_objects() {
+            Ok(mut iter) => {
+                while let Some(obj) = iter.pop() {
+                    // Check if this is a validator object
+                    if !matches!(obj.object_type, silver_core::ObjectType::Validator) {
+                        continue;
+                    }
+
+                    let validator_id = obj.id.to_base58();
+                    let owner_addr = match &obj.owner {
+                        silver_core::Owner::AddressOwner(addr) => addr.to_hex(),
+                        _ => "unknown".to_string(),
+                    };
+
+                    // Parse validator metadata from object data
+                    let validator_data = String::from_utf8_lossy(&obj.data);
+                    let (gossip_addr, tpu_addr) = if let Some(metadata_str) = validator_data.split('|').next() {
+                        // Parse the metadata string to extract network addresses
+                        let parts: Vec<&str> = metadata_str.split(',').collect();
+                        let gossip = if parts.len() > 0 {
+                            parts[0].trim().to_string()
+                        } else {
+                            "127.0.0.1:8000".to_string()
+                        };
+                        let tpu = if parts.len() > 1 {
+                            parts[1].trim().to_string()
+                        } else {
+                            "127.0.0.1:8001".to_string()
+                        };
+                        (gossip, tpu)
+                    } else {
+                        (
+                            "127.0.0.1:8000".to_string(),
+                            "127.0.0.1:8001".to_string(),
+                        )
+                    };
+
+                    nodes.push(serde_json::json!({
+                        "pubkey": validator_id,
+                        "owner": owner_addr,
+                        "gossip": gossip_addr,
+                        "tpu": tpu_addr,
+                        "rpc": "127.0.0.1:8899",
+                        "version": "1.0.0",
+                    }));
+                }
+            }
+            Err(e) => {
+                warn!("Failed to query validators for cluster nodes: {}", e);
+                // Return empty nodes list on error
+            }
+        }
 
         let response = serde_json::json!({
             "nodes": nodes,
@@ -789,7 +947,11 @@ impl ExplorerEndpoints {
     /// silver_getFeeForMessage - Get fee for a message
     pub fn silver_get_fee_for_message(&self, params: JsonValue) -> Result<JsonValue, JsonRpcError> {
         let start = Instant::now();
-        let request: GetFeeForMessageRequest = serde_json::from_value(params)
+        
+        // Normalize parameters: array format [message] or object format
+        let params_obj = Self::normalize_params(params, &["message"])?;
+        
+        let request: GetFeeForMessageRequest = serde_json::from_value(params_obj)
             .map_err(|e| JsonRpcError::invalid_params(format!("Invalid parameters: {}", e)))?;
 
         debug!("Getting fee for message");
@@ -866,17 +1028,46 @@ impl ExplorerEndpoints {
         debug!("Getting largest accounts");
 
         // Scan all objects and collect account balances
-        let account_balances: std::collections::BTreeMap<String, u128> = std::collections::BTreeMap::new();
+        let mut account_balances: std::collections::BTreeMap<String, u128> = std::collections::BTreeMap::new();
         
-        // In a real implementation, we would iterate through all objects
-        // For now, return empty map as we need to implement proper object iteration
-        match self.object_store.get_object_count() {
-            Ok(count) => {
-                debug!("Total objects in store: {}", count);
-                // TODO: Implement object iterator in ObjectStore
+        match self.object_store.iterate_all_objects() {
+            Ok(mut iter) => {
+                let mut total_scanned = 0u64;
+                while let Some(obj) = iter.pop() {
+                    total_scanned += 1;
+                    
+                    // Only process coin objects
+                    if !matches!(obj.object_type, silver_core::ObjectType::Coin) {
+                        continue;
+                    }
+
+                    // Extract owner address
+                    let owner_addr = match &obj.owner {
+                        silver_core::Owner::AddressOwner(addr) => addr.to_hex(),
+                        _ => continue,
+                    };
+
+                    // Extract balance from coin data (u64 little-endian)
+                    let balance = if obj.data.len() >= 8 {
+                        u64::from_le_bytes([
+                            obj.data[0], obj.data[1], obj.data[2], obj.data[3],
+                            obj.data[4], obj.data[5], obj.data[6], obj.data[7],
+                        ]) as u128
+                    } else {
+                        0u128
+                    };
+
+                    // Aggregate balance for this owner
+                    *account_balances.entry(owner_addr).or_insert(0) += balance;
+                }
+                debug!("Scanned {} objects for largest accounts", total_scanned);
             }
             Err(e) => {
-                warn!("Failed to scan objects for largest accounts: {}", e);
+                error!("Failed to iterate objects for largest accounts: {}", e);
+                return Err(JsonRpcError::internal_error(format!(
+                    "Failed to scan objects: {}",
+                    e
+                )));
             }
         }
 
@@ -976,37 +1167,104 @@ impl ExplorerEndpoints {
     pub fn silver_query_events(&self, params: JsonValue) -> Result<JsonValue, JsonRpcError> {
         let start = Instant::now();
 
-        let request: QueryEventsRequest = serde_json::from_value(params)
+        // Normalize parameters: array format [filter, limit, cursor] or object format
+        let params_obj = Self::normalize_params(params, &["filter", "limit", "cursor"])?;
+
+        let request: QueryEventsRequest = serde_json::from_value(params_obj)
             .map_err(|e| JsonRpcError::invalid_params(format!("Invalid parameters: {}", e)))?;
 
         debug!("Querying events with filter: {:?}", request.filter);
 
         // Query events from event store with pagination
         let limit = request.limit.unwrap_or(50).min(1000);
+        let cursor_offset = request
+            .cursor
+            .as_ref()
+            .and_then(|c| c.strip_prefix("cursor_").and_then(|s| s.parse::<usize>().ok()))
+            .unwrap_or(0);
 
-        // For production implementation, this would:
-        // 1. Apply filter criteria to event store
-        // 2. Sort by timestamp descending
-        // 3. Apply pagination using cursor
-        // 4. Return results with next_cursor for pagination
+        // Query all events from the event store
+        let mut all_events: Vec<(u64, JsonValue)> = Vec::new();
 
-        let events: Vec<JsonValue> = Vec::new();
-        let has_next_page = events.len() >= limit;
+        // Iterate through all objects to find events
+        match self.object_store.iterate_all_objects() {
+            Ok(mut iter) => {
+                while let Some(obj) = iter.pop() {
+                    // Check if this is an event object
+                    if !matches!(obj.object_type, silver_core::ObjectType::Event) {
+                        continue;
+                    }
+
+                    // Parse event data
+                    let event_data = String::from_utf8_lossy(&obj.data);
+                    
+                    // Extract timestamp from object version (used as event timestamp)
+                    let timestamp = obj.version.value() as u64;
+
+                    // Apply filter if provided
+                    let should_include = if let Some(filter) = &request.filter {
+                        // Filter by event type if specified
+                        if let Some(event_type) = filter.get("event_type").and_then(|v| v.as_str()) {
+                            event_data.contains(event_type)
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+
+                    if should_include {
+                        let event_json = serde_json::json!({
+                            "id": obj.id.to_base58(),
+                            "type": "event",
+                            "data": event_data.to_string(),
+                            "timestamp": timestamp,
+                            "sender": match &obj.owner {
+                                silver_core::Owner::AddressOwner(addr) => addr.to_hex(),
+                                _ => "unknown".to_string(),
+                            },
+                        });
+                        all_events.push((timestamp, event_json));
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to iterate objects for events: {}", e);
+                // Continue with empty events list
+            }
+        }
+
+        // Sort by timestamp descending (most recent first)
+        all_events.sort_by(|a, b| b.0.cmp(&a.0));
+
+        // Get total count before consuming the vector
+        let total_count = all_events.len();
+
+        // Apply pagination
+        let paginated_events: Vec<JsonValue> = all_events
+            .into_iter()
+            .skip(cursor_offset)
+            .take(limit)
+            .map(|(_, event)| event)
+            .collect();
+
+        let has_next_page = cursor_offset + limit < total_count;
         let next_cursor = if has_next_page {
-            Some(format!("cursor_{}", limit))
+            Some(format!("cursor_{}", cursor_offset + limit))
         } else {
             None
         };
 
         let response = serde_json::json!({
-            "events": events,
+            "events": paginated_events,
             "next_cursor": next_cursor,
             "has_next_page": has_next_page,
-            "count": events.len(),
+            "count": paginated_events.len(),
+            "total": total_count,
         });
 
         let elapsed = start.elapsed();
-        debug!("Queried {} events in {:?}", events.len(), elapsed);
+        debug!("Queried {} events in {:?}", paginated_events.len(), elapsed);
 
         Ok(response)
     }

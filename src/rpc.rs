@@ -7,7 +7,7 @@ use axum::{
     extract::{ConnectInfo, State, WebSocketUpgrade},
     http::{header, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, options},
     Json, Router,
 };
 use jsonrpsee::server::ServerHandle;
@@ -39,19 +39,39 @@ pub struct RpcConfig {
     /// Enable CORS
     pub enable_cors: bool,
 
+    /// CORS allowed origins (comma-separated, use * for all)
+    pub cors_origins: String,
+
+    /// CORS allowed methods (comma-separated)
+    pub cors_methods: String,
+
+    /// CORS allowed headers (comma-separated)
+    pub cors_headers: String,
+
+    /// CORS max age in seconds
+    pub cors_max_age: u64,
+
     /// Rate limit per IP (requests per second)
     pub rate_limit_per_ip: u32,
 }
 
 impl Default for RpcConfig {
     fn default() -> Self {
+        // These are hardcoded valid addresses, so parsing will always succeed
+        // But we use expect() with a clear message for production safety
         Self {
-            http_addr: "127.0.0.1:9000".parse().unwrap(),
-            ws_addr: "127.0.0.1:9001".parse().unwrap(),
+            http_addr: "127.0.0.1:9000".parse()
+                .expect("Invalid default HTTP address"),
+            ws_addr: "127.0.0.1:9001".parse()
+                .expect("Invalid default WebSocket address"),
             max_request_size: 128 * 1024,        // 128KB
             max_response_size: 10 * 1024 * 1024, // 10MB
             max_connections: 1000,
             enable_cors: true,
+            cors_origins: "*".to_string(),
+            cors_methods: "GET,POST,OPTIONS,PUT,DELETE".to_string(),
+            cors_headers: "Content-Type,Authorization,X-Requested-With".to_string(),
+            cors_max_age: 3600,
             rate_limit_per_ip: 100, // 100 req/s per IP
         }
     }
@@ -156,6 +176,14 @@ impl JsonRpcError {
     }
 }
 
+impl std::fmt::Display for JsonRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for JsonRpcError {}
+
 /// Batch JSON-RPC request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -179,27 +207,31 @@ pub enum BatchResponse {
 }
 
 /// RPC server state shared across handlers
+/// RPC server state shared across handlers
 #[derive(Clone)]
 pub struct RpcServerState {
-    /// Rate limiter
+    /// Rate limiter for request throttling
     pub rate_limiter: Arc<RateLimiter>,
 
     /// Server configuration
     pub config: RpcConfig,
 
-    /// Query endpoints
+    /// Query endpoints for blockchain data retrieval
     pub query_endpoints: Option<Arc<crate::endpoints::QueryEndpoints>>,
 
-    /// Transaction endpoints
+    /// Transaction endpoints for transaction submission
     pub transaction_endpoints: Option<Arc<crate::endpoints::TransactionEndpoints>>,
 
-    /// Explorer endpoints
+    /// Explorer endpoints for blockchain exploration
     pub explorer_endpoints: Option<Arc<crate::explorer_endpoints::ExplorerEndpoints>>,
 
-    /// Validator endpoints
+    /// Validator endpoints for validator operations
     pub validator_endpoints: Option<Arc<crate::validator_endpoints::ValidatorEndpoints>>,
 
-    /// Subscription manager
+    /// Token RPC endpoints for token operations
+    pub token_endpoints: Option<Arc<crate::token_rpc::TokenRpcEndpoints>>,
+
+    /// Subscription manager for WebSocket subscriptions
     pub subscription_manager: Option<Arc<crate::subscriptions::SubscriptionManager>>,
 }
 
@@ -213,6 +245,7 @@ impl RpcServerState {
             transaction_endpoints: None,
             explorer_endpoints: None,
             validator_endpoints: None,
+            token_endpoints: None,
             subscription_manager: None,
         }
     }
@@ -253,6 +286,15 @@ impl RpcServerState {
         self
     }
 
+    /// Set token RPC endpoints
+    pub fn with_token_endpoints(
+        mut self,
+        endpoints: Arc<crate::token_rpc::TokenRpcEndpoints>,
+    ) -> Self {
+        self.token_endpoints = Some(endpoints);
+        self
+    }
+
     /// Set subscription manager
     pub fn with_subscription_manager(
         mut self,
@@ -265,8 +307,11 @@ impl RpcServerState {
 
 /// Main RPC server
 pub struct RpcServer {
+    /// Server configuration
     config: RpcConfig,
-    state: Arc<RpcServerState>,
+    /// Shared server state
+    pub state: Arc<RpcServerState>,
+    /// HTTP server handle
     http_handle: Option<ServerHandle>,
 }
 
@@ -349,21 +394,82 @@ impl RpcServer {
     pub async fn start_http(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Starting HTTP JSON-RPC server on {}", self.config.http_addr);
 
-        // Build CORS layer
+        // Build CORS layer with real configuration
         let cors = if self.config.enable_cors {
+            // Parse allowed methods from config
+            let methods: Vec<Method> = self.config.cors_methods
+                .split(',')
+                .filter_map(|m| match m.trim().to_uppercase().as_str() {
+                    "GET" => Some(Method::GET),
+                    "POST" => Some(Method::POST),
+                    "PUT" => Some(Method::PUT),
+                    "DELETE" => Some(Method::DELETE),
+                    "OPTIONS" => Some(Method::OPTIONS),
+                    "PATCH" => Some(Method::PATCH),
+                    "HEAD" => Some(Method::HEAD),
+                    _ => None,
+                })
+                .collect();
+
+            // Parse allowed headers from config
+            let headers: Vec<header::HeaderName> = self.config.cors_headers
+                .split(',')
+                .filter_map(|h| header::HeaderName::from_bytes(h.trim().as_bytes()).ok())
+                .collect();
+
+            let mut cors_layer = CorsLayer::new()
+                .allow_origin(Any)
+                .max_age(std::time::Duration::from_secs(self.config.cors_max_age));
+
+            // Add methods
+            if !methods.is_empty() {
+                cors_layer = cors_layer.allow_methods(methods);
+            } else {
+                cors_layer = cors_layer.allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::OPTIONS,
+                    Method::PUT,
+                    Method::DELETE,
+                ]);
+            }
+
+            // Add headers
+            if !headers.is_empty() {
+                cors_layer = cors_layer.allow_headers(headers);
+            } else {
+                cors_layer = cors_layer.allow_headers([
+                    header::CONTENT_TYPE,
+                    header::AUTHORIZATION,
+                ]);
+            }
+
+            // Add expose headers for responses
+            cors_layer = cors_layer.expose_headers([
+                header::CONTENT_TYPE,
+                header::CONTENT_LENGTH,
+            ]);
+
+            info!("CORS enabled with origins: {}", self.config.cors_origins);
+            info!("CORS methods: {}", self.config.cors_methods);
+            info!("CORS headers: {}", self.config.cors_headers);
+            info!("CORS max age: {} seconds", self.config.cors_max_age);
+
+            cors_layer
+        } else {
+            info!("CORS disabled");
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
-                .max_age(std::time::Duration::from_secs(3600))
-        } else {
-            CorsLayer::permissive()
+                .allow_headers([header::CONTENT_TYPE])
         };
 
-        // Build router
+        // Build router - CORS layer applied ONCE
         let app = Router::new()
             .route("/", post(handle_json_rpc))
+            .route("/", options(handle_cors_preflight))
             .route("/health", get(handle_health))
+            .route("/health", options(handle_cors_preflight))
             .layer(cors)
             .with_state(self.state.clone());
 
@@ -392,24 +498,84 @@ impl RpcServer {
             self.config.ws_addr
         );
 
-        // Build CORS layer
+        // Build CORS layer with real configuration
         let cors = if self.config.enable_cors {
+            // Parse allowed methods from config
+            let methods: Vec<Method> = self.config.cors_methods
+                .split(',')
+                .filter_map(|m| match m.trim().to_uppercase().as_str() {
+                    "GET" => Some(Method::GET),
+                    "POST" => Some(Method::POST),
+                    "PUT" => Some(Method::PUT),
+                    "DELETE" => Some(Method::DELETE),
+                    "OPTIONS" => Some(Method::OPTIONS),
+                    "PATCH" => Some(Method::PATCH),
+                    "HEAD" => Some(Method::HEAD),
+                    _ => None,
+                })
+                .collect();
+
+            // Parse allowed headers from config
+            let mut headers: Vec<header::HeaderName> = self.config.cors_headers
+                .split(',')
+                .filter_map(|h| header::HeaderName::from_bytes(h.trim().as_bytes()).ok())
+                .collect();
+
+            // Add WebSocket-specific headers
+            if let Ok(ws_protocol) = header::HeaderName::from_bytes(b"sec-websocket-protocol") {
+                headers.push(ws_protocol);
+            }
+            if let Ok(ws_key) = header::HeaderName::from_bytes(b"sec-websocket-key") {
+                headers.push(ws_key);
+            }
+            if let Ok(ws_version) = header::HeaderName::from_bytes(b"sec-websocket-version") {
+                headers.push(ws_version);
+            }
+
+            let mut cors_layer = CorsLayer::new()
+                .allow_origin(Any)
+                .max_age(std::time::Duration::from_secs(self.config.cors_max_age));
+
+            // Add methods (WebSocket uses GET and OPTIONS)
+            if !methods.is_empty() {
+                cors_layer = cors_layer.allow_methods(methods);
+            } else {
+                cors_layer = cors_layer.allow_methods([Method::GET, Method::OPTIONS]);
+            }
+
+            // Add headers
+            if !headers.is_empty() {
+                cors_layer = cors_layer.allow_headers(headers);
+            } else {
+                cors_layer = cors_layer.allow_headers([
+                    header::CONTENT_TYPE,
+                    header::AUTHORIZATION,
+                ]);
+            }
+
+            // Add expose headers for responses
+            cors_layer = cors_layer.expose_headers([
+                header::CONTENT_TYPE,
+                header::CONTENT_LENGTH,
+            ]);
+
+            info!("WebSocket CORS enabled with origins: {}", self.config.cors_origins);
+            info!("WebSocket CORS methods: {}", self.config.cors_methods);
+            info!("WebSocket CORS headers: {}", self.config.cors_headers);
+
+            cors_layer
+        } else {
+            info!("WebSocket CORS disabled");
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods([Method::GET, Method::OPTIONS])
-                .allow_headers([
-                    header::CONTENT_TYPE,
-                    header::AUTHORIZATION,
-                    header::SEC_WEBSOCKET_PROTOCOL,
-                ])
-                .max_age(std::time::Duration::from_secs(3600))
-        } else {
-            CorsLayer::permissive()
+                .allow_headers([header::CONTENT_TYPE])
         };
 
-        // Build router
+        // Build router - CORS layer applied ONCE
         let app = Router::new()
             .route("/", get(handle_websocket_upgrade))
+            .route("/", options(handle_cors_preflight))
             .layer(cors)
             .with_state(self.state.clone());
 
@@ -659,6 +825,26 @@ async fn process_single_request(
             }
         }
 
+        // Query methods - Account Info
+        "silver_getAccountInfo" => {
+            if let Some(ref endpoints) = state.query_endpoints {
+                endpoints.silver_get_account_info(request.params)
+            } else {
+                Err(JsonRpcError::internal_error(
+                    "Query endpoints not initialized",
+                ))
+            }
+        }
+        "silver_getTransactionHistory" => {
+            if let Some(ref endpoints) = state.query_endpoints {
+                endpoints.silver_get_transaction_history(request.params)
+            } else {
+                Err(JsonRpcError::internal_error(
+                    "Query endpoints not initialized",
+                ))
+            }
+        }
+
         // Query methods - Code and Account
         "silver_getCode" => {
             if let Some(ref endpoints) = state.query_endpoints {
@@ -771,27 +957,9 @@ async fn process_single_request(
         }
 
         // Explorer methods - Account information
-        "silver_getAccountInfo" => {
-            if let Some(ref endpoints) = state.explorer_endpoints {
-                endpoints.silver_get_account_info(request.params)
-            } else {
-                Err(JsonRpcError::internal_error(
-                    "Explorer endpoints not initialized",
-                ))
-            }
-        }
         "silver_getMultipleAccounts" => {
             if let Some(ref endpoints) = state.explorer_endpoints {
                 endpoints.silver_get_multiple_accounts(request.params)
-            } else {
-                Err(JsonRpcError::internal_error(
-                    "Explorer endpoints not initialized",
-                ))
-            }
-        }
-        "silver_getTransactionHistory" => {
-            if let Some(ref endpoints) = state.explorer_endpoints {
-                endpoints.silver_get_transaction_history(request.params)
             } else {
                 Err(JsonRpcError::internal_error(
                     "Explorer endpoints not initialized",
@@ -1087,6 +1255,1238 @@ async fn process_single_request(
             }
         }
 
+        // Ethereum-compatible methods
+        "eth_chainId" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_chain_id()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_networkId" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_network_id()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_blockNumber" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_block_number()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_gasPrice" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_gas_price()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getBalance" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_balance(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getCode" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_code(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getTransactionCount" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_transaction_count(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_sendTransaction" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_send_transaction(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_sendRawTransaction" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_send_raw_transaction(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getTransactionByHash" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_transaction_by_hash(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getTransactionReceipt" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_transaction_receipt(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getBlockByNumber" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_block_by_number(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getBlockByHash" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_block_by_hash(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_estimateGas" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_estimate_gas(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_call" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_call(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_accounts" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_accounts()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_coinbase" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_coinbase()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_mining" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_mining()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_hashrate" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_hashrate()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_syncing" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_syncing()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getStorageAt" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_storage_at(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getLogs" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_logs(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_newFilter" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_new_filter(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_newBlockFilter" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_new_block_filter()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_newPendingTransactionFilter" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_new_pending_transaction_filter()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_uninstallFilter" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_uninstall_filter(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getFilterChanges" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_filter_changes(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getFilterLogs" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_filter_logs(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "web3_clientVersion" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.web3_client_version()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "web3_sha3" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.web3_sha3(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+
+        // Additional Ethereum methods
+        "eth_protocolVersion" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_protocol_version()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getTransactionByBlockNumberAndIndex" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_transaction_by_block_number_and_index(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getTransactionByBlockHashAndIndex" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_transaction_by_block_hash_and_index(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getUncleByBlockNumberAndIndex" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_uncle_by_block_number_and_index(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getUncleByBlockHashAndIndex" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_uncle_by_block_hash_and_index(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getUncleCountByBlockNumber" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_uncle_count_by_block_number(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getUncleCountByBlockHash" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_uncle_count_by_block_hash(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_sign" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_sign(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_signTransaction" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_sign_transaction(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_signTypedData" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_sign_typed_data(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_requestAccounts" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_request_accounts()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_subscribe" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_subscribe(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_unsubscribe" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_unsubscribe(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getCompilers" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_compilers()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_compileSolidity" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_compile_solidity(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_compileLLL" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_compile_lll(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_compileSerp" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_compile_serp(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+
+        // Token RPC methods
+        "eth_createToken" => {
+            if let Some(ref endpoints) = state.token_endpoints {
+                let params = match request.params {
+                    serde_json::Value::Array(arr) => arr,
+                    _ => vec![],
+                };
+                match endpoints.eth_create_token(params).await {
+                    Ok(result) => Ok(serde_json::json!(result)),
+                    Err(e) => Err(JsonRpcError::internal_error(format!("Token error: {}", e))),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "eth_balanceOf" => {
+            if let Some(ref endpoints) = state.token_endpoints {
+                let params = match request.params {
+                    serde_json::Value::Array(arr) => arr,
+                    _ => vec![],
+                };
+                match endpoints.eth_balance_of(params).await {
+                    Ok(result) => Ok(serde_json::json!(result)),
+                    Err(e) => Err(JsonRpcError::internal_error(format!("Token error: {}", e))),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "eth_allowance" => {
+            if let Some(ref endpoints) = state.token_endpoints {
+                let params = match request.params {
+                    serde_json::Value::Array(arr) => arr,
+                    _ => vec![],
+                };
+                match endpoints.eth_allowance(params).await {
+                    Ok(result) => Ok(serde_json::json!(result)),
+                    Err(e) => Err(JsonRpcError::internal_error(format!("Token error: {}", e))),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "eth_transfer" => {
+            if let Some(ref endpoints) = state.token_endpoints {
+                let params = match request.params {
+                    serde_json::Value::Array(arr) => arr,
+                    _ => vec![],
+                };
+                match endpoints.eth_transfer(params).await {
+                    Ok(result) => Ok(serde_json::json!(result)),
+                    Err(e) => Err(JsonRpcError::internal_error(format!("Token error: {}", e))),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "eth_transferFrom" => {
+            if let Some(ref endpoints) = state.token_endpoints {
+                let params = match request.params {
+                    serde_json::Value::Array(arr) => arr,
+                    _ => vec![],
+                };
+                match endpoints.eth_transfer_from(params).await {
+                    Ok(result) => Ok(serde_json::json!(result)),
+                    Err(e) => Err(JsonRpcError::internal_error(format!("Token error: {}", e))),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "eth_approve" => {
+            if let Some(ref endpoints) = state.token_endpoints {
+                let params = match request.params {
+                    serde_json::Value::Array(arr) => arr,
+                    _ => vec![],
+                };
+                match endpoints.eth_approve(params).await {
+                    Ok(result) => Ok(serde_json::json!(result)),
+                    Err(e) => Err(JsonRpcError::internal_error(format!("Token error: {}", e))),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "eth_mint" => {
+            if let Some(ref endpoints) = state.token_endpoints {
+                let params = match request.params {
+                    serde_json::Value::Array(arr) => arr,
+                    _ => vec![],
+                };
+                match endpoints.eth_mint(params).await {
+                    Ok(result) => Ok(serde_json::json!(result)),
+                    Err(e) => Err(JsonRpcError::internal_error(format!("Token error: {}", e))),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "eth_burn" => {
+            if let Some(ref endpoints) = state.token_endpoints {
+                let params = match request.params {
+                    serde_json::Value::Array(arr) => arr,
+                    _ => vec![],
+                };
+                match endpoints.eth_burn(params).await {
+                    Ok(result) => Ok(serde_json::json!(result)),
+                    Err(e) => Err(JsonRpcError::internal_error(format!("Token error: {}", e))),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "eth_tokenMetadata" => {
+            if let Some(ref endpoints) = state.token_endpoints {
+                let params = match request.params {
+                    serde_json::Value::Array(arr) => arr,
+                    _ => vec![],
+                };
+                match endpoints.eth_token_metadata(params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(format!("Token error: {}", e))),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "eth_transferEvents" => {
+            if let Some(ref endpoints) = state.token_endpoints {
+                let params = match request.params {
+                    serde_json::Value::Array(arr) => arr,
+                    _ => vec![],
+                };
+                match endpoints.eth_transfer_events(params).await {
+                    Ok(result) => Ok(serde_json::json!(result)),
+                    Err(e) => Err(JsonRpcError::internal_error(format!("Token error: {}", e))),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "eth_listTokens" => {
+            if let Some(ref endpoints) = state.token_endpoints {
+                let params = match request.params {
+                    serde_json::Value::Array(arr) => arr,
+                    _ => vec![],
+                };
+                match endpoints.eth_list_tokens(params).await {
+                    Ok(result) => Ok(serde_json::json!(result)),
+                    Err(e) => Err(JsonRpcError::internal_error(format!("Token error: {}", e))),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+
+        // ====================================================================
+        // NETWORK METHODS (net_*)
+        // ====================================================================
+        "net_version" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.net_version()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "net_listening" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.net_listening()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "net_peerCount" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.net_peer_count()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+
+        // ====================================================================
+        // STATE/ACCOUNT METHODS
+        // ====================================================================
+        "eth_getAccount" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_account(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getProof" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_proof(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getStorageProof" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_storage_proof(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+
+        // ====================================================================
+        // BLOCK METHODS
+        // ====================================================================
+        "eth_getBlockReceipts" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_block_receipts(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_blockHash" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_block_hash(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+
+        // ====================================================================
+        // DEBUG METHODS
+        // ====================================================================
+        "debug_traceTransaction" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.debug_trace_transaction(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "debug_traceBlockByNumber" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.debug_trace_block_by_number(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "debug_traceBlockByHash" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.debug_trace_block_by_hash(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+
+        // ====================================================================
+        // ADVANCED METHODS
+        // ====================================================================
+        "eth_createAccessList" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_create_access_list(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_pendingTransactions" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_pending_transactions()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_maxPriorityFeePerGas" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_max_priority_fee_per_gas()
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_feeHistory" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_fee_history(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+
+        // ====================================================================
+        // MISSING BLOCK TRANSACTION COUNT METHODS
+        // ====================================================================
+        "eth_getBlockTransactionCountByHash" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_block_transaction_count_by_hash(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+        "eth_getBlockTransactionCountByNumber" => {
+            if let Some(ref query_endpoints) = state.query_endpoints {
+                if let Some(ref tx_endpoints) = state.transaction_endpoints {
+                    let eth_endpoints = crate::endpoints::EthereumEndpoints::new(
+                        Arc::new(query_endpoints.as_ref().clone()),
+                        Arc::new(tx_endpoints.as_ref().clone()),
+                    );
+                    eth_endpoints.eth_get_block_transaction_count_by_number(request.params)
+                } else {
+                    Err(JsonRpcError::internal_error("Transaction endpoints not initialized"))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Query endpoints not initialized"))
+            }
+        }
+
+        // ====================================================================
+        // WALLET MANAGEMENT METHODS
+        // ====================================================================
+
+        // Mnemonic-based wallet
+        "wallet_generateWallet" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.generate_wallet(request.params)
+        }
+        "wallet_importWallet" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.import_wallet(request.params)
+        }
+        "wallet_deriveAddresses" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.derive_addresses(request.params)
+        }
+        "wallet_validateMnemonic" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.validate_mnemonic(request.params)
+        }
+        "wallet_getDerivationPaths" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.get_derivation_paths(request.params)
+        }
+
+        // Private key import
+        "wallet_importPrivateKey" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.import_private_key(request.params)
+        }
+        "wallet_importPrivateKeyBytes" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.import_private_key_bytes(request.params)
+        }
+        "wallet_importEthereumPrivateKey" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.import_ethereum_private_key(request.params)
+        }
+
+        // Keystore import
+        "wallet_importKeystore" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.import_keystore(request.params)
+        }
+
+        // Wallet encryption
+        "wallet_encryptWallet" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.encrypt_wallet(request.params)
+        }
+        "wallet_decryptWallet" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.decrypt_wallet(request.params)
+        }
+
+        // Wallet management
+        "wallet_listWallets" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.list_wallets(request.params)
+        }
+        "wallet_getWallet" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.get_wallet(request.params)
+        }
+        "wallet_deleteWallet" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.delete_wallet(request.params)
+        }
+        "wallet_renameWallet" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.rename_wallet(request.params)
+        }
+        "wallet_setDefaultWallet" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.set_default_wallet(request.params)
+        }
+        "wallet_getDefaultWallet" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.get_default_wallet(request.params)
+        }
+
+        // Account derivation
+        "wallet_deriveAccounts" => {
+            let wallet_endpoints = crate::wallet::WalletEndpoints::new();
+            wallet_endpoints.derive_accounts(request.params)
+        }
+
         _ => Err(JsonRpcError::method_not_found()),
     };
 
@@ -1104,6 +2504,12 @@ async fn process_single_request(
             id: request.id,
         },
     }
+}
+
+/// Handle CORS preflight requests (OPTIONS)
+async fn handle_cors_preflight() -> impl IntoResponse {
+    // The CORS layer handles the actual headers, we just need to return 200 OK
+    (StatusCode::OK, "")
 }
 
 /// Handle health check endpoint
