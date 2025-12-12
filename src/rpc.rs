@@ -231,6 +231,12 @@ pub struct RpcServerState {
     /// Token RPC endpoints for token operations
     pub token_endpoints: Option<Arc<crate::token_rpc::TokenRpcEndpoints>>,
 
+    /// DEX endpoints for DEX operations
+    pub dex_endpoints: Option<Arc<crate::dex_endpoints::DexEndpoints>>,
+
+    /// Bridge endpoints for bridge operations
+    pub bridge_endpoints: Option<Arc<crate::bridge_endpoints::BridgeEndpoints>>,
+
     /// Subscription manager for WebSocket subscriptions
     pub subscription_manager: Option<Arc<crate::subscriptions::SubscriptionManager>>,
 }
@@ -246,6 +252,8 @@ impl RpcServerState {
             explorer_endpoints: None,
             validator_endpoints: None,
             token_endpoints: None,
+            dex_endpoints: None,
+            bridge_endpoints: None,
             subscription_manager: None,
         }
     }
@@ -292,6 +300,24 @@ impl RpcServerState {
         endpoints: Arc<crate::token_rpc::TokenRpcEndpoints>,
     ) -> Self {
         self.token_endpoints = Some(endpoints);
+        self
+    }
+
+    /// Set DEX endpoints
+    pub fn with_dex_endpoints(
+        mut self,
+        endpoints: Arc<crate::dex_endpoints::DexEndpoints>,
+    ) -> Self {
+        self.dex_endpoints = Some(endpoints);
+        self
+    }
+
+    /// Set Bridge endpoints
+    pub fn with_bridge_endpoints(
+        mut self,
+        endpoints: Arc<crate::bridge_endpoints::BridgeEndpoints>,
+    ) -> Self {
+        self.bridge_endpoints = Some(endpoints);
         self
     }
 
@@ -2485,6 +2511,401 @@ async fn process_single_request(
         "wallet_deriveAccounts" => {
             let wallet_endpoints = crate::wallet::WalletEndpoints::new();
             wallet_endpoints.derive_accounts(request.params)
+        }
+
+        // Token methods
+        "token_create" => {
+            if let Some(ref token_endpoints) = state.token_endpoints {
+                let params_array = match request.params {
+                    JsonValue::Array(arr) => arr,
+                    JsonValue::Object(obj) => vec![JsonValue::Object(obj)],
+                    _ => vec![],
+                };
+                
+                if params_array.is_empty() {
+                    Err(JsonRpcError::invalid_params("Missing parameters"))
+                } else {
+                    match serde_json::from_value::<crate::token_rpc::CreateTokenRequest>(params_array[0].clone()) {
+                        Ok(req) => {
+                            let result = token_endpoints.create_token(req).await;
+                            result.map(|v| JsonValue::String(v))
+                                .map_err(|e| JsonRpcError::internal_error(e.message().to_string()))
+                        }
+                        Err(e) => Err(JsonRpcError::invalid_params(format!("Invalid parameters: {}", e)))
+                    }
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "token_transfer" => {
+            if let Some(ref token_endpoints) = state.token_endpoints {
+                let params_array = match request.params {
+                    JsonValue::Array(arr) => arr,
+                    JsonValue::Object(obj) => vec![JsonValue::Object(obj)],
+                    _ => vec![],
+                };
+                
+                if params_array.is_empty() {
+                    Err(JsonRpcError::invalid_params("Missing parameters"))
+                } else {
+                    match serde_json::from_value::<crate::token_rpc::TransferRequest>(params_array[0].clone()) {
+                        Ok(req) => {
+                            let result = token_endpoints.transfer(req).await;
+                            result.map(|v| JsonValue::String(v))
+                                .map_err(|e| JsonRpcError::internal_error(e.message().to_string()))
+                        }
+                        Err(e) => Err(JsonRpcError::invalid_params(format!("Invalid parameters: {}", e)))
+                    }
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "token_balanceOf" => {
+            if let Some(ref token_endpoints) = state.token_endpoints {
+                let params_array = match request.params {
+                    JsonValue::Array(arr) => arr,
+                    _ => vec![],
+                };
+                
+                if params_array.len() < 2 {
+                    Err(JsonRpcError::invalid_params("Missing parameters"))
+                } else {
+                    let symbol = params_array[0].as_str().unwrap_or("").to_string();
+                    let account = params_array[1].as_str().unwrap_or("").to_string();
+                    
+                    let result = token_endpoints.balance_of(symbol, account).await;
+                    result.map(|v| JsonValue::String(v))
+                        .map_err(|e| JsonRpcError::internal_error(e.message().to_string()))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "token_metadata" => {
+            if let Some(ref token_endpoints) = state.token_endpoints {
+                let params_array = match request.params {
+                    JsonValue::Array(arr) => arr,
+                    _ => vec![],
+                };
+                
+                if params_array.is_empty() {
+                    Err(JsonRpcError::invalid_params("Missing parameters"))
+                } else {
+                    let symbol = params_array[0].as_str().unwrap_or("").to_string();
+                    
+                    let result = token_endpoints.get_metadata(symbol).await;
+                    result.map(|v| serde_json::to_value(v).unwrap_or(JsonValue::Null))
+                        .map_err(|e| JsonRpcError::internal_error(e.message().to_string()))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "token_approve" => {
+            if let Some(ref token_endpoints) = state.token_endpoints {
+                let params_array = match request.params {
+                    JsonValue::Array(arr) => arr,
+                    _ => vec![],
+                };
+                
+                if params_array.len() < 4 {
+                    Err(JsonRpcError::invalid_params("Missing parameters"))
+                } else {
+                    let symbol = params_array[0].as_str().unwrap_or("").to_string();
+                    let owner = params_array[1].as_str().unwrap_or("").to_string();
+                    let spender = params_array[2].as_str().unwrap_or("").to_string();
+                    let amount = params_array[3].as_str().unwrap_or("0").to_string();
+                    
+                    let result = token_endpoints.approve(symbol, owner, spender, amount).await;
+                    result.map(|v| JsonValue::String(v))
+                        .map_err(|e| JsonRpcError::internal_error(e.message().to_string()))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "token_allowance" => {
+            if let Some(ref token_endpoints) = state.token_endpoints {
+                let params_array = match request.params {
+                    JsonValue::Array(arr) => arr,
+                    _ => vec![],
+                };
+                
+                if params_array.len() < 3 {
+                    Err(JsonRpcError::invalid_params("Missing parameters"))
+                } else {
+                    let symbol = params_array[0].as_str().unwrap_or("").to_string();
+                    let owner = params_array[1].as_str().unwrap_or("").to_string();
+                    let spender = params_array[2].as_str().unwrap_or("").to_string();
+                    
+                    let result = token_endpoints.allowance(symbol, owner, spender).await;
+                    result.map(|v| JsonValue::String(v))
+                        .map_err(|e| JsonRpcError::internal_error(e.message().to_string()))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "token_mint" => {
+            if let Some(ref token_endpoints) = state.token_endpoints {
+                let params_array = match request.params {
+                    JsonValue::Array(arr) => arr,
+                    _ => vec![],
+                };
+                
+                if params_array.len() < 4 {
+                    Err(JsonRpcError::invalid_params("Missing parameters"))
+                } else {
+                    let symbol = params_array[0].as_str().unwrap_or("").to_string();
+                    let minter = params_array[1].as_str().unwrap_or("").to_string();
+                    let to = params_array[2].as_str().unwrap_or("").to_string();
+                    let amount = params_array[3].as_str().unwrap_or("0").to_string();
+                    
+                    let result = token_endpoints.mint(symbol, minter, to, amount).await;
+                    result.map(|v| JsonValue::String(v))
+                        .map_err(|e| JsonRpcError::internal_error(e.message().to_string()))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "token_burn" => {
+            if let Some(ref token_endpoints) = state.token_endpoints {
+                let params_array = match request.params {
+                    JsonValue::Array(arr) => arr,
+                    _ => vec![],
+                };
+                
+                if params_array.len() < 4 {
+                    Err(JsonRpcError::invalid_params("Missing parameters"))
+                } else {
+                    let symbol = params_array[0].as_str().unwrap_or("").to_string();
+                    let burner = params_array[1].as_str().unwrap_or("").to_string();
+                    let from = params_array[2].as_str().unwrap_or("").to_string();
+                    let amount = params_array[3].as_str().unwrap_or("0").to_string();
+                    
+                    let result = token_endpoints.burn(symbol, burner, from, amount).await;
+                    result.map(|v| JsonValue::String(v))
+                        .map_err(|e| JsonRpcError::internal_error(e.message().to_string()))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "token_list" => {
+            if let Some(ref token_endpoints) = state.token_endpoints {
+                let result = token_endpoints.list_tokens().await;
+                result.map(|v| serde_json::to_value(v).unwrap_or(JsonValue::Null))
+                    .map_err(|e| JsonRpcError::internal_error(e.message().to_string()))
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+        "token_totalSupply" => {
+            if let Some(ref token_endpoints) = state.token_endpoints {
+                let params_array = match request.params {
+                    JsonValue::Array(arr) => arr,
+                    _ => vec![],
+                };
+                
+                if params_array.is_empty() {
+                    Err(JsonRpcError::invalid_params("Missing parameters"))
+                } else {
+                    let symbol = params_array[0].as_str().unwrap_or("").to_string();
+                    
+                    let result = token_endpoints.total_supply(symbol).await;
+                    result.map(|v| JsonValue::String(v))
+                        .map_err(|e| JsonRpcError::internal_error(e.message().to_string()))
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Token endpoints not initialized"))
+            }
+        }
+
+        // DEX methods
+        "dex_createPool" => {
+            if let Some(ref dex_endpoints) = state.dex_endpoints {
+                match dex_endpoints.create_pool(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("DEX endpoints not initialized"))
+            }
+        }
+        "dex_addLiquidity" => {
+            if let Some(ref dex_endpoints) = state.dex_endpoints {
+                match dex_endpoints.add_liquidity(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("DEX endpoints not initialized"))
+            }
+        }
+        "dex_removeLiquidity" => {
+            if let Some(ref dex_endpoints) = state.dex_endpoints {
+                match dex_endpoints.remove_liquidity(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("DEX endpoints not initialized"))
+            }
+        }
+        "dex_swap" => {
+            if let Some(ref dex_endpoints) = state.dex_endpoints {
+                match dex_endpoints.swap(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("DEX endpoints not initialized"))
+            }
+        }
+        "dex_getPrice" => {
+            if let Some(ref dex_endpoints) = state.dex_endpoints {
+                match dex_endpoints.get_price(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("DEX endpoints not initialized"))
+            }
+        }
+        "dex_getPool" => {
+            if let Some(ref dex_endpoints) = state.dex_endpoints {
+                match dex_endpoints.get_pool(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("DEX endpoints not initialized"))
+            }
+        }
+        "dex_listPools" => {
+            if let Some(ref dex_endpoints) = state.dex_endpoints {
+                match dex_endpoints.list_pools(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("DEX endpoints not initialized"))
+            }
+        }
+        "dex_getStats" => {
+            if let Some(ref dex_endpoints) = state.dex_endpoints {
+                match dex_endpoints.get_stats(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("DEX endpoints not initialized"))
+            }
+        }
+
+        // Bridge methods
+        "bridge_registerValidator" => {
+            if let Some(ref bridge_endpoints) = state.bridge_endpoints {
+                match bridge_endpoints.register_validator(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Bridge endpoints not initialized"))
+            }
+        }
+        "bridge_unregisterValidator" => {
+            if let Some(ref bridge_endpoints) = state.bridge_endpoints {
+                match bridge_endpoints.unregister_validator(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Bridge endpoints not initialized"))
+            }
+        }
+        "bridge_initiate" => {
+            if let Some(ref bridge_endpoints) = state.bridge_endpoints {
+                match bridge_endpoints.initiate(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Bridge endpoints not initialized"))
+            }
+        }
+        "bridge_confirm" => {
+            if let Some(ref bridge_endpoints) = state.bridge_endpoints {
+                match bridge_endpoints.confirm(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Bridge endpoints not initialized"))
+            }
+        }
+        "bridge_execute" => {
+            if let Some(ref bridge_endpoints) = state.bridge_endpoints {
+                match bridge_endpoints.execute(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Bridge endpoints not initialized"))
+            }
+        }
+        "bridge_cancel" => {
+            if let Some(ref bridge_endpoints) = state.bridge_endpoints {
+                match bridge_endpoints.cancel(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Bridge endpoints not initialized"))
+            }
+        }
+        "bridge_getStatus" => {
+            if let Some(ref bridge_endpoints) = state.bridge_endpoints {
+                match bridge_endpoints.get_status(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Bridge endpoints not initialized"))
+            }
+        }
+        "bridge_getValidator" => {
+            if let Some(ref bridge_endpoints) = state.bridge_endpoints {
+                match bridge_endpoints.get_validator(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Bridge endpoints not initialized"))
+            }
+        }
+        "bridge_listValidators" => {
+            if let Some(ref bridge_endpoints) = state.bridge_endpoints {
+                match bridge_endpoints.list_validators(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Bridge endpoints not initialized"))
+            }
+        }
+        "bridge_getStats" => {
+            if let Some(ref bridge_endpoints) = state.bridge_endpoints {
+                match bridge_endpoints.get_stats(request.params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsonRpcError::internal_error(e)),
+                }
+            } else {
+                Err(JsonRpcError::internal_error("Bridge endpoints not initialized"))
+            }
         }
 
         _ => Err(JsonRpcError::method_not_found()),

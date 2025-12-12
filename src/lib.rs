@@ -43,6 +43,8 @@
 #![forbid(unsafe_code)]
 
 pub mod admin_rpc;
+pub mod bridge_endpoints;
+pub mod dex_endpoints;
 pub mod endpoints;
 pub mod ethereum_complete;
 pub mod explorer_endpoints;
@@ -56,6 +58,8 @@ pub mod validator_endpoints;
 pub mod wallet;
 
 pub use admin_rpc::{AdminEndpoints, PeerInfo, PeerManager};
+pub use bridge_endpoints::BridgeEndpoints;
+pub use dex_endpoints::DexEndpoints;
 pub use endpoints::{EthereumEndpoints, QueryEndpoints, TransactionEndpoints};
 pub use ethereum_complete::{
     AccountStateManager, BlockHeader, BlockValidator, EthereumRpcHandler, FilterManager,
